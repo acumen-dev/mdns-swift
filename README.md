@@ -5,7 +5,7 @@ Shared mDNS/DNS-SD service discovery for Swift — used by [matter-swift](https:
 [![Swift 6.1+](https://img.shields.io/badge/Swift-6.1+-orange.svg)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/Platforms-macOS%20|%20iOS%20|%20Linux-blue.svg)](https://swift.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE.md)
-[![CI](https://github.com/monagle/mdns-swift/actions/workflows/ci.yml/badge.svg)](https://github.com/monagle/mdns-swift/actions/workflows/ci.yml)
+[![CI](https://github.com/acumen-dev/mdns-swift/actions/workflows/ci.yml/badge.svg)](https://github.com/acumen-dev/mdns-swift/actions/workflows/ci.yml)
 
 ## Overview
 
@@ -35,7 +35,7 @@ Add `mdns-swift` to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/monagle/mdns-swift.git", from: "0.1.0")
+    .package(url: "https://github.com/acumen-dev/mdns-swift.git", from: "0.1.0")
 ]
 ```
 
