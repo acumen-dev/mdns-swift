@@ -35,7 +35,7 @@ Add `mdns-swift` to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/acumen-dev/mdns-swift.git", from: "0.1.0")
+    .package(url: "https://github.com/acumen-dev/mdns-swift.git", from: "1.0.0")
 ]
 ```
 
