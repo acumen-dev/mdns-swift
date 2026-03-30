@@ -265,7 +265,7 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
                 let instanceName = domainParts.first.map(String.init) ?? domain
                 let serviceTypeParts = domainParts.dropFirst().dropLast().joined(separator: ".")
                 let discovered = ServiceRecord(
-                    name: instanceName, serviceType: serviceTypeParts,
+                    name: instanceName, serviceType: ServiceType(serviceTypeParts),
                     host: "", port: 0, txtRecords: [:]
                 )
                 for cont in conts.values { cont.yield(discovered) }
