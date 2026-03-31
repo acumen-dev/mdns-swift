@@ -138,10 +138,11 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         // Both commissionable and operational use the system hostname (nil = default).
         let hostParam: String? = nil
 
-        // Both commissionable and operational are scoped to the primary LAN interface.
-        // Previously operational used ifIndex=0 (all interfaces) but that combined
-        // with the custom hostname caused homed's mDNS resolution to time out.
-        let serviceIfIndex: UInt32 = ifIndex
+        // HAP accessories must advertise on all interfaces so iOS can discover
+        // them regardless of whether the server is on Ethernet or Wi-Fi.
+        // Matter services restrict to the primary LAN to avoid VPN/Tailscale
+        // addresses interfering with CASE session establishment.
+        let serviceIfIndex: UInt32 = service.serviceType.rawValue == "_hap._tcp" ? 0 : ifIndex
 
         var sdRef: DNSServiceRef?
         let err: DNSServiceErrorType = txtData.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) in
