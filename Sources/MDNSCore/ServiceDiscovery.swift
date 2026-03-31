@@ -67,6 +67,15 @@ public struct ServiceRecord: Sendable {
     /// Passing `nil` means no preference.
     public let preferredInterface: String?
 
+    /// When `true`, the service is advertised on all network interfaces (`ifIndex = 0`).
+    ///
+    /// Use this for protocols that must be reachable from any interface — for example,
+    /// HAP accessories need to be discoverable by iOS whether the Mac is connected via
+    /// Ethernet or Wi-Fi. The default (`false`) restricts advertisement to the primary
+    /// LAN interface, which prevents VPN/Tailscale addresses from interfering with
+    /// protocols like Matter that rely on specific link addresses for session establishment.
+    public let advertiseOnAllInterfaces: Bool
+
     public init(
         name: String,
         serviceType: ServiceType,
@@ -74,7 +83,8 @@ public struct ServiceRecord: Sendable {
         port: UInt16,
         txtRecords: [String: String] = [:],
         subtypes: [String] = [],
-        preferredInterface: String? = nil
+        preferredInterface: String? = nil,
+        advertiseOnAllInterfaces: Bool = false
     ) {
         self.name = name
         self.serviceType = serviceType
@@ -83,6 +93,7 @@ public struct ServiceRecord: Sendable {
         self.txtRecords = txtRecords
         self.subtypes = subtypes
         self.preferredInterface = preferredInterface
+        self.advertiseOnAllInterfaces = advertiseOnAllInterfaces
     }
 }
 

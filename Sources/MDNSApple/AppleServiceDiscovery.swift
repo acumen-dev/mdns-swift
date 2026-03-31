@@ -128,21 +128,24 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         let lan = primaryLANInterface()
         let ifIndex = lan?.index ?? 0
 
-        if let lan {
+        // Both commissionable and operational use the system hostname (nil = default).
+        let hostParam: String? = nil
+
+        // Callers that need to be reachable from any interface (e.g. HAP accessories
+        // discoverable on both Ethernet and Wi-Fi) set `advertiseOnAllInterfaces = true`,
+        // which passes ifIndex=0 to DNSServiceRegister.  The default restricts to the
+        // primary LAN interface to prevent VPN/Tailscale addresses from interfering with
+        // protocols like Matter that rely on specific link addresses for session establishment.
+        let serviceIfIndex: UInt32 = service.advertiseOnAllInterfaces ? 0 : ifIndex
+
+        if service.advertiseOnAllInterfaces {
+            logger.debug("mDNS advertising '\(service.name)' on all interfaces")
+        } else if let lan {
             logger.debug("mDNS advertising '\(service.name)' restricted to \(lan.name) (ifIndex=\(lan.index), \(lan.ipv4))")
         }
         if service.serviceType.rawValue == "_matter._tcp" {
             logNetworkInterfaces()
         }
-
-        // Both commissionable and operational use the system hostname (nil = default).
-        let hostParam: String? = nil
-
-        // HAP accessories must advertise on all interfaces so iOS can discover
-        // them regardless of whether the server is on Ethernet or Wi-Fi.
-        // Matter services restrict to the primary LAN to avoid VPN/Tailscale
-        // addresses interfering with CASE session establishment.
-        let serviceIfIndex: UInt32 = service.serviceType.rawValue == "_hap._tcp" ? 0 : ifIndex
 
         var sdRef: DNSServiceRef?
         let err: DNSServiceErrorType = txtData.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) in
