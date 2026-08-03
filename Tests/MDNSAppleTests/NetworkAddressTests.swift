@@ -30,12 +30,29 @@ struct NetworkAddressTests {
         try #require(urlBuilds(fromHost: address.host))
     }
 
-    @Test("an interface-scoped IPv4 endpoint (e.g. \"192.168.1.23%en1\") is rejected")
+    @Test("an interface-scoped IPv4 endpoint (e.g. \"192.168.1.23%en1\") is rejected when no fallback is given")
     func scopedIPv4Rejected() throws {
         let addr = try #require(IPv4Address("192.168.1.23%en1"))
         #expect(addr.interface != nil) // sanity: this really is what we think it is
         let endpoint = NWEndpoint.hostPort(host: .ipv4(addr), port: 80)
         #expect(NetworkAddress(endpoint: endpoint) == nil)
+    }
+
+    @Test("a scoped IPv4 endpoint substitutes the fallback hostname but keeps the resolved port")
+    func scopedIPv4UsesFallbackHostnamePreservingPort() throws {
+        let addr = try #require(IPv4Address("192.168.173.104%en1"))
+        let endpoint = NWEndpoint.hostPort(host: .ipv4(addr), port: 80)
+        let address = try #require(NetworkAddress(endpoint: endpoint, fallbackHostname: "shelly1.local"))
+        #expect(address.host == "shelly1.local")
+        // The real, actual bug this guards against: a caller that discards
+        // a scoped address's port along with its rejected host — falling
+        // back to a bare "<name>.local" guess with no port info, since mDNS
+        // browsing alone never carries one — ends up dispatching to port 0,
+        // which fails at request-submission time (NSURLErrorBadURL) even
+        // though `URLComponents` itself doesn't reject it. Confirmed
+        // against real hardware — see CLAUDE.md item 5's fix history.
+        #expect(address.port == 80)
+        try #require(urlBuilds(fromHost: address.host, port: Int(address.port)))
     }
 
     @Test("a plain (unscoped) global/ULA IPv6 endpoint resolves to a bracketed, URL-safe host")
@@ -47,12 +64,30 @@ struct NetworkAddressTests {
         try #require(urlBuilds(fromHost: address.host))
     }
 
-    @Test("a link-local (interface-scoped) IPv6 endpoint is rejected, not bracketed as-is")
+    @Test("a link-local (interface-scoped) IPv6 endpoint is rejected, not bracketed as-is, when no fallback is given")
     func scopedIPv6Rejected() throws {
         let addr = try #require(IPv6Address("fe80::1234:5678:9abc:def0%en0"))
         #expect(addr.interface != nil)
         let endpoint = NWEndpoint.hostPort(host: .ipv6(addr), port: 80)
         #expect(NetworkAddress(endpoint: endpoint) == nil)
+    }
+
+    @Test("a scoped IPv6 endpoint substitutes the fallback hostname but keeps the resolved port")
+    func scopedIPv6UsesFallbackHostnamePreservingPort() throws {
+        let addr = try #require(IPv6Address("fe80::1234:5678:9abc:def0%en0"))
+        let endpoint = NWEndpoint.hostPort(host: .ipv6(addr), port: 8080)
+        let address = try #require(NetworkAddress(endpoint: endpoint, fallbackHostname: "shelly1.local"))
+        #expect(address.host == "shelly1.local")
+        #expect(address.port == 8080)
+        try #require(urlBuilds(fromHost: address.host, port: Int(address.port)))
+    }
+
+    @Test("a plain, unscoped address ignores a supplied fallback hostname entirely")
+    func unscopedAddressIgnoresFallback() throws {
+        let addr = try #require(IPv4Address("192.168.1.23"))
+        let endpoint = NWEndpoint.hostPort(host: .ipv4(addr), port: 80)
+        let address = try #require(NetworkAddress(endpoint: endpoint, fallbackHostname: "shelly1.local"))
+        #expect(address.host == "192.168.1.23")
     }
 
     @Test("a .name host (an mDNS hostname target) passes through unchanged")
@@ -73,11 +108,11 @@ struct NetworkAddressTests {
     /// does hand back must be usable to build a real URL — this is the
     /// exact construction `ShellyHTTPTransportConfiguration.makeURL()` (and
     /// any future consumer) performs.
-    private func urlBuilds(fromHost host: String) -> Bool {
+    private func urlBuilds(fromHost host: String, port: Int = 80) -> Bool {
         var components = URLComponents()
         components.scheme = "http"
         components.host = host
-        components.port = 80
+        components.port = port
         components.path = "/rpc"
         return components.url != nil
     }

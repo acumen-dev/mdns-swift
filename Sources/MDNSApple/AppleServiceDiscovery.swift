@@ -241,8 +241,9 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         // to end even when mDNS opportunistically announces one. If no
         // IPv4-constrained attempt succeeds in time, fall through to an
         // unconstrained attempt — whatever `currentPath.remoteEndpoint`
-        // resolves to. Either attempt can still yield a scoped address,
-        // which `NetworkAddress(endpoint:)` rejects — see its doc comment.
+        // resolves to. Either attempt can still yield a scoped address; see
+        // `resolveOnce`'s `fallbackHostname` use for why that's not a
+        // failure.
         let ipv4Parameters = NWParameters.udp
         if let ipOptions = ipv4Parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
             ipOptions.version = .v4
@@ -280,8 +281,21 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
                         guard !resumed else { return }
                         switch state {
                         case .ready:
+                            // A `fallbackHostname` matters even here, not
+                            // just in the caller's own resolve-failure
+                            // fallback: a scoped host still carries a
+                            // correctly-resolved port from this same SRV
+                            // lookup, which mDNS *browsing* alone never
+                            // provides (`ServiceRecord.port` is `0` until
+                            // something resolves it) — losing that port by
+                            // treating a scoped host as a hard failure would
+                            // just move the same "not a valid URL" problem
+                            // from a bad host to a bad (`0`) port.
                             if let remoteEndpoint = connection.currentPath?.remoteEndpoint,
-                               let address = NetworkAddress(endpoint: remoteEndpoint) {
+                               let address = NetworkAddress(
+                                   endpoint: remoteEndpoint,
+                                   fallbackHostname: "\(recordName).local"
+                               ) {
                                 resumed = true
                                 cont.resume(returning: address)
                             } else {
