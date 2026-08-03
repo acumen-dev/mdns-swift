@@ -219,47 +219,102 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         }
     }
 
+    /// How long an IPv4-constrained resolve attempt gets before falling back
+    /// to an unconstrained one. Needed because an `NWConnection` with no
+    /// viable path for its constraint (e.g. an IPv4-only connection to a
+    /// device with no IPv4 address) commonly parks in `.waiting` rather than
+    /// transitioning to `.failed` — without a deadline, ``resolve(_:)``
+    /// would simply hang for an IPv6-only device instead of falling back.
+    static let ipv4PreferenceTimeout: Duration = .seconds(2)
+
     public func resolve(_ record: ServiceRecord) async throws -> NetworkAddress {
-        // Create a connection to the browsed service to trigger resolution
         let endpoint = NWEndpoint.service(
             name: record.name,
             type: record.serviceType.rawValue,
             domain: "local.",
             interface: nil
         )
-        let connection = NWConnection(to: endpoint, using: .udp)
 
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<NetworkAddress, Error>) in
-            nonisolated(unsafe) var resumed = false
-            connection.stateUpdateHandler = { [weak self] state in
-                guard let self else { return }
-                guard !resumed else { return }
-                switch state {
-                case .ready:
-                    if let remoteEndpoint = connection.currentPath?.remoteEndpoint,
-                       let address = NetworkAddress(endpoint: remoteEndpoint) {
-                        resumed = true
-                        cont.resume(returning: address)
-                    } else {
-                        resumed = true
-                        cont.resume(throwing: ServiceDiscoveryError.resolveFailed(record.name))
+        // Prefer IPv4: most LAN smart-home devices this library targets
+        // (Shelly, Hue, Matter accessories) are IPv4-first in practice, and
+        // an unscoped IPv6 candidate isn't guaranteed to exist or work end
+        // to end even when mDNS opportunistically announces one. If no
+        // IPv4-constrained attempt succeeds in time, fall through to an
+        // unconstrained attempt — whatever `currentPath.remoteEndpoint`
+        // resolves to. Either attempt can still yield a scoped address,
+        // which `NetworkAddress(endpoint:)` rejects — see its doc comment.
+        let ipv4Parameters = NWParameters.udp
+        if let ipOptions = ipv4Parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ipOptions.version = .v4
+        }
+        if let address = try? await resolveOnce(
+            endpoint: endpoint,
+            parameters: ipv4Parameters,
+            recordName: record.name,
+            timeout: Self.ipv4PreferenceTimeout
+        ) {
+            return address
+        }
+
+        return try await resolveOnce(endpoint: endpoint, parameters: .udp, recordName: record.name, timeout: nil)
+    }
+
+    /// One resolve attempt over one `NWConnection`, optionally bounded by
+    /// `timeout` (used only for the IPv4-preference attempt — an
+    /// unconstrained fallback attempt has nothing further to fall back to,
+    /// so it runs until `NWConnection` itself reports `.ready`/`.failed`).
+    private func resolveOnce(
+        endpoint: NWEndpoint,
+        parameters: NWParameters,
+        recordName: String,
+        timeout: Duration?
+    ) async throws -> NetworkAddress {
+        let connection = NWConnection(to: endpoint, using: parameters)
+
+        return try await withThrowingTaskGroup(of: NetworkAddress.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<NetworkAddress, Error>) in
+                    nonisolated(unsafe) var resumed = false
+                    connection.stateUpdateHandler = { [weak self] state in
+                        guard let self else { return }
+                        guard !resumed else { return }
+                        switch state {
+                        case .ready:
+                            if let remoteEndpoint = connection.currentPath?.remoteEndpoint,
+                               let address = NetworkAddress(endpoint: remoteEndpoint) {
+                                resumed = true
+                                cont.resume(returning: address)
+                            } else {
+                                resumed = true
+                                cont.resume(throwing: ServiceDiscoveryError.resolveFailed(recordName))
+                            }
+                            connection.cancel()
+                        case .failed(let error):
+                            self.logger.error("Resolve failed for '\(recordName)': \(error)")
+                            resumed = true
+                            cont.resume(throwing: error)
+                            connection.cancel()
+                        case .cancelled:
+                            if !resumed {
+                                resumed = true
+                                cont.resume(throwing: CancellationError())
+                            }
+                        default:
+                            break
+                        }
                     }
-                    connection.cancel()
-                case .failed(let error):
-                    self.logger.error("Resolve failed for '\(record.name)': \(error)")
-                    resumed = true
-                    cont.resume(throwing: error)
-                    connection.cancel()
-                case .cancelled:
-                    if !resumed {
-                        resumed = true
-                        cont.resume(throwing: CancellationError())
-                    }
-                default:
-                    break
+                    connection.start(queue: self.queue)
                 }
             }
-            connection.start(queue: self.queue)
+            if let timeout {
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    connection.cancel()
+                    throw ServiceDiscoveryError.resolveFailed(recordName)
+                }
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
         }
     }
 
