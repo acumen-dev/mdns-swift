@@ -252,40 +252,70 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
     }
 
     private func handleResponse(_ msg: DNSMessage) {
-        for record in msg.answers + msg.additionals {
-            switch record.rdata {
-            case .ptr(let domain):
-                let parts = record.name.split(separator: ".")
-                guard parts.count >= 3 else { continue }
-                // record.name is e.g. "_hap._tcp.local" — strip ".local" for lookup key
-                let serviceTypeKey = parts.dropLast().joined(separator: ".")
-                guard let conts = browseStreams[serviceTypeKey], !conts.isEmpty else { continue }
-                // domain is "InstanceName._hap._tcp.local"
-                let domainParts = domain.split(separator: ".")
-                let instanceName = domainParts.first.map(String.init) ?? domain
-                let serviceTypeParts = domainParts.dropFirst().dropLast().joined(separator: ".")
-                let discovered = ServiceRecord(
-                    name: instanceName, serviceType: ServiceType(serviceTypeParts),
-                    host: "", port: 0, txtRecords: [:]
-                )
-                for cont in conts.values { cont.yield(discovered) }
+        let records = msg.answers + msg.additionals
 
-            case .a(let bytes):
-                guard bytes.count == 4 else { continue }
-                let host = "\(bytes[0]).\(bytes[1]).\(bytes[2]).\(bytes[3])"
-                fulfillResolve(recordName: record.name, host: host)
-
-            case .aaaa(let bytes):
-                guard bytes.count == 16 else { continue }
-                let groups = stride(from: 0, to: 16, by: 2).map { i in
-                    String(format: "%x", UInt16(bytes[i]) << 8 | UInt16(bytes[i + 1]))
-                }
-                fulfillResolve(recordName: record.name, host: groups.joined(separator: ":"))
-
-            default:
-                break
-            }
+        for record in records {
+            guard case .ptr(let domain) = record.rdata else { continue }
+            let parts = record.name.split(separator: ".")
+            guard parts.count >= 3 else { continue }
+            // record.name is e.g. "_hap._tcp.local" — strip ".local" for lookup key
+            let serviceTypeKey = parts.dropLast().joined(separator: ".")
+            guard let conts = browseStreams[serviceTypeKey], !conts.isEmpty else { continue }
+            // domain is "InstanceName._hap._tcp.local"
+            let domainParts = domain.split(separator: ".")
+            let instanceName = domainParts.first.map(String.init) ?? domain
+            let serviceTypeParts = domainParts.dropFirst().dropLast().joined(separator: ".")
+            let discovered = ServiceRecord(
+                name: instanceName, serviceType: ServiceType(serviceTypeParts),
+                host: "", port: 0, txtRecords: [:]
+            )
+            for cont in conts.values { cont.yield(discovered) }
         }
+
+        for (recordName, host) in Self.resolvableHosts(from: records) {
+            fulfillResolve(recordName: recordName, host: host)
+        }
+    }
+
+    /// Extracts `(recordName, host)` pairs from A/AAAA records in resolve
+    /// order — **every A match before any AAAA match**, regardless of the
+    /// order records happened to appear in the packet. `fulfillResolve`
+    /// resolves and discards the pending continuation on its first call for
+    /// a given name, so whichever pair is considered first always wins;
+    /// without this ordering, an AAAA record placed earlier in the same
+    /// response would win over an A record placed later, even though this
+    /// library otherwise prefers IPv4 throughout (see `MDNSApple`'s
+    /// equivalent preference in `AppleServiceDiscovery.resolve`). This only
+    /// resolves the single-packet case — an AAAA-only packet arriving
+    /// before a separate, later A-only packet for the same name is a
+    /// cross-packet race this cannot fix without buffering, which isn't
+    /// implemented here.
+    ///
+    /// An AAAA record's 16 raw bytes are formatted as a bracketed IPv6
+    /// literal (`"[fe80:0:0:0:1234:5678:9abc:def0]"`) — RFC 3986 requires
+    /// the brackets; a bare colon-separated literal is not a valid URL host
+    /// and previously broke `URLComponents`-based transports downstream
+    /// (see the sibling fix in `MDNSApple`'s `NetworkAddress(endpoint:)`).
+    /// No zero-run compression (`::`) — verbose but unambiguous, and this
+    /// hand-rolled parser has no need to match `nw_path`/`getnameinfo`'s
+    /// exact canonical form.
+    ///
+    /// Pure and side-effect-free — the actual regression coverage for both
+    /// fixes lives here, unit-testable with no live socket involved.
+    static func resolvableHosts(from records: [DNSRecord]) -> [(recordName: String, host: String)] {
+        var results: [(recordName: String, host: String)] = []
+        for record in records {
+            guard case .a(let bytes) = record.rdata, bytes.count == 4 else { continue }
+            results.append((record.name, "\(bytes[0]).\(bytes[1]).\(bytes[2]).\(bytes[3])"))
+        }
+        for record in records {
+            guard case .aaaa(let bytes) = record.rdata, bytes.count == 16 else { continue }
+            let groups = stride(from: 0, to: 16, by: 2).map { i in
+                String(format: "%x", UInt16(bytes[i]) << 8 | UInt16(bytes[i + 1]))
+            }
+            results.append((record.name, "[\(groups.joined(separator: ":"))]"))
+        }
+        return results
     }
 
     private func fulfillResolve(recordName: String, host: String) {
