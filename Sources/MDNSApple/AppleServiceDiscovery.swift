@@ -83,6 +83,26 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         self.logger = logger
     }
 
+    // MARK: - TXT Encoding
+
+    /// Encode TXT key/value pairs into RFC 6763 wire format: each entry is a
+    /// length byte followed by the UTF-8 bytes of `"key=value"`.
+    ///
+    /// Hand-rolled because `NetService.data(fromTXTRecord:)` is unavailable on
+    /// watchOS (and deprecated everywhere else). Keys are sorted so the output
+    /// is deterministic; entries longer than 255 bytes are truncated, matching
+    /// the Linux responder's TXT encoding. An empty dictionary yields empty
+    /// `Data`, which `DNSServiceRegister` accepts as "no TXT record".
+    static func txtRecordData(_ records: [String: String]) -> Data {
+        var out = Data()
+        for (key, value) in records.sorted(by: { $0.key < $1.key }) {
+            let bytes = Array("\(key)=\(value)".utf8)
+            out.append(UInt8(min(bytes.count, 255)))
+            out.append(contentsOf: bytes.prefix(255))
+        }
+        return out
+    }
+
     // MARK: - ServiceDiscovery
 
     public func advertise(service: ServiceRecord) async throws {
@@ -96,9 +116,8 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
             DNSServiceRefDeallocate(ref)
         }
 
-        // Build TXT record payload using the NetService helper for correct wire encoding.
-        let txtDict = service.txtRecords.mapValues { $0.data(using: .utf8) ?? Data() }
-        let txtData = NetService.data(fromTXTRecord: txtDict)
+        // Build the TXT record payload in RFC 6763 wire format.
+        let txtData = Self.txtRecordData(service.txtRecords)
 
         // Build the regtype string.
         // DNSServiceRegister natively supports comma-separated subtypes:
