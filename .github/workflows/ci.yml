@@ -41,6 +41,38 @@ jobs:
       - name: Test
         run: swift test
 
+  # ── Apple platform floors ──────────────────────────────────────────────────
+  # Build-only cross-compiles that validate the platform floors declared in
+  # Package.swift. Catches APIs that are unavailable on a platform (e.g.
+  # NetService on watchOS) or newer than a declared floor — neither of which
+  # the native macOS build can see.
+  #
+  # Versionless triples pick up the deployment target from Package.swift.
+  # visionOS needs an explicit version in the triple because SwiftPM
+  # synthesizes an invalid default (xros10.13) for a versionless xros triple;
+  # keep it in sync with the .visionOS floor in Package.swift.
+  apple-platforms:
+    name: ${{ matrix.platform.name }} (build only)
+    runs-on: macos-15
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: iOS,      triple: arm64-apple-ios,      sdk: iphoneos }
+          - { name: tvOS,     triple: arm64-apple-tvos,     sdk: appletvos }
+          - { name: watchOS,  triple: arm64-apple-watchos,  sdk: watchos }
+          - { name: visionOS, triple: arm64-apple-xros1.0,  sdk: xros }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: >
+          swift build
+          --triple ${{ matrix.platform.triple }}
+          --sdk "$(xcrun --sdk ${{ matrix.platform.sdk }} --show-sdk-path)"
+
   # ── Linux ──────────────────────────────────────────────────────────────────
   linux:
     name: Linux
