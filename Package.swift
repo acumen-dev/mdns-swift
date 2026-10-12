@@ -44,6 +44,12 @@ let package = Package(
         ),
         .testTarget(name: "MDNSCoreTests",  dependencies: ["MDNSCore"]),
         .testTarget(name: "MDNSAppleTests", dependencies: ["MDNSApple"]),
-        .testTarget(name: "MDNSLinuxTests", dependencies: ["MDNSLinux"]),
+        .testTarget(
+            name: "MDNSLinuxTests",
+            dependencies: [
+                "MDNSLinux",
+                .product(name: "NIOCore", package: "swift-nio"),
+            ]
+        ),
     ]
 )

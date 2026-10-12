@@ -72,6 +72,18 @@ struct LinuxServiceDiscoveryResolveTests {
         #expect(LinuxServiceDiscovery.resolvableHosts(from: [ptr]).isEmpty)
     }
 
+    @Test("records decoded off the wire (Data slices of the message) format without trapping")
+    func decodedRecordsFormat() throws {
+        let v6 = Data([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0])
+        let message = DNSMessage(isResponse: true, answers: [
+            DNSRecord(name: "host-1.local", type: .aaaa, ttl: 120, rdata: .aaaa(v6)),
+            DNSRecord(name: "host-1.local", type: .a, ttl: 120, rdata: .a(Data([192, 0, 2, 1]))),
+        ])
+        let decoded = try #require(DNSMessage.decode(from: message.encode()))
+        let hosts = LinuxServiceDiscovery.resolvableHosts(from: decoded.answers).map(\.host)
+        #expect(hosts == ["192.0.2.1", "[fe80:0:0:0:1234:5678:9abc:def0]"])
+    }
+
     private func urlBuilds(fromHost host: String) -> Bool {
         var components = URLComponents()
         components.scheme = "http"

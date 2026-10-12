@@ -201,7 +201,7 @@ public struct DNSMessage: Sendable {
               let flags  = parser.readUInt16(),
               let qdcount = parser.readUInt16(),
               let ancount = parser.readUInt16(),
-              let _       = parser.readUInt16(), // nscount
+              let nscount = parser.readUInt16(),
               let arcount = parser.readUInt16()
         else { return nil }
 
@@ -222,13 +222,18 @@ public struct DNSMessage: Sendable {
             questions.append(DNSQuestion(name: name, type: type, unicastResponse: unicast))
         }
 
-        for _ in 0..<(ancount + arcount) {
+        for _ in 0..<ancount {
             guard let record = parser.readRecord() else { return nil }
-            if answers.count < Int(ancount) {
-                answers.append(record)
-            } else {
-                additionals.append(record)
-            }
+            answers.append(record)
+        }
+        // Authority records (e.g. a probe's proposed records) are read past
+        // and dropped, so the additionals that follow decode in place.
+        for _ in 0..<nscount {
+            guard parser.readRecord() != nil else { return nil }
+        }
+        for _ in 0..<arcount {
+            guard let record = parser.readRecord() else { return nil }
+            additionals.append(record)
         }
 
         return DNSMessage(
@@ -349,7 +354,9 @@ struct DNSParser {
             while offset < end {
                 guard let slen = readUInt8() else { break }
                 guard let bytes = readBytes(Int(slen)) else { break }
-                strings.append(String(bytes: bytes, encoding: .utf8) ?? "")
+                // Invalid UTF-8 becomes U+FFFD rather than emptying the
+                // string, so a TXT entry keeps its key (see `TXTRecord`).
+                strings.append(String(decoding: bytes, as: UTF8.self))
             }
             rdata = .txt(strings)
         case .a:
