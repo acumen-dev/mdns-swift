@@ -194,4 +194,38 @@ struct TXTRecordDecodeTests {
         bytes.append(contentsOf: "b=2".utf8)
         #expect(TXTRecord.decode(wireFormat: bytes) == ["a": "1"])
     }
+
+    // MARK: Malformed input (pinned)
+
+    @Test("A 255-byte entry is kept whole")
+    func maximumLengthEntry() {
+        let value = String(repeating: "v", count: 253)
+        var bytes: [UInt8] = [255]
+        bytes.append(contentsOf: "k=\(value)".utf8)
+        #expect(TXTRecord.decode(wireFormat: bytes) == ["k": value])
+        #expect(TXTRecord.decode(["k=\(value)"]) == ["k": value])
+    }
+
+    @Test("Non-UTF-8 value bytes are replaced with U+FFFD and the key is kept")
+    func nonUTF8Value() {
+        let entry: [UInt8] = Array("k=".utf8) + [0xFF, 0x41]
+        let bytes: [UInt8] = [UInt8(entry.count)] + entry
+        #expect(TXTRecord.decode(wireFormat: bytes) == ["k": "\u{FFFD}A"])
+    }
+
+    @Test("An entry with no key ('=v') is dropped")
+    func keylessEntryDropped() {
+        #expect(TXTRecord.decode(["=v"]) == [:])
+        #expect(TXTRecord.decode(wireFormat: [2] + Array("=v".utf8)) == [:])
+    }
+
+    @Test("The split is at the first '=' byte, even when a combining mark follows it")
+    func combiningMarkAfterEquals() {
+        #expect(TXTRecord.decode(["a=\u{301}b"]) == ["a": "\u{301}b"])
+    }
+
+    @Test("Duplicate detection lowercases ASCII only: the Kelvin sign is not 'k'")
+    func kelvinSignIsNotK() {
+        #expect(TXTRecord.decode(["k=1", "\u{212A}=2"]) == ["k": "1", "\u{212A}": "2"])
+    }
 }

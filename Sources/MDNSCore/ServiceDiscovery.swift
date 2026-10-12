@@ -129,48 +129,56 @@ public struct ResolvedService: Sendable, Hashable {
 /// implementation so browse and resolve results follow one rule:
 ///
 /// - `key=value` → `value`; `key=` → `""`; a bare `key` (no `=`) → `""`.
+/// - Each entry splits at its first `=` byte, so a value may itself contain
+///   `=`, and a combining mark after the `=` stays in the value.
 /// - Empty strings, and strings beginning with `=` (no key), are ignored —
 ///   so a TXT record holding a single empty string decodes to `[:]`.
-/// - Keys are kept as received. Keys compare case-insensitively (§6.4), and
-///   when a key repeats, the first occurrence wins.
-public enum TXTRecord {
+/// - Keys are kept as received. Keys compare case-insensitively over ASCII
+///   only (§6.4 keys are printable US-ASCII), and when a key repeats, the
+///   first occurrence wins.
+/// - Bytes that are not valid UTF-8 are replaced with U+FFFD; the entry is
+///   kept.
+package enum TXTRecord {
 
     /// Decode TXT character-strings, in the order received.
-    public static func decode(_ strings: [String]) -> [String: String] {
-        var records: [String: String] = [:]
-        var seen: Set<String> = []
-        for string in strings {
-            let key: Substring
-            let value: Substring
-            if let separator = string.firstIndex(of: "=") {
-                key = string[..<separator]
-                value = string[string.index(after: separator)...]
-            } else {
-                key = string[...]
-                value = ""
-            }
-            guard !key.isEmpty, seen.insert(key.lowercased()).inserted else { continue }
-            records[String(key)] = String(value)
-        }
-        return records
+    package static func decode(_ strings: [String]) -> [String: String] {
+        decode(entries: strings.map { Array($0.utf8) })
     }
 
     /// Decode a TXT record in wire format: a sequence of character-strings,
     /// each a length byte followed by that many bytes. An entry that overruns
-    /// the buffer ends decoding. Values are decoded as UTF-8, with invalid
-    /// sequences replaced rather than dropping the key.
-    public static func decode(wireFormat bytes: some Collection<UInt8>) -> [String: String] {
+    /// the buffer ends decoding.
+    package static func decode(wireFormat bytes: some Collection<UInt8>) -> [String: String] {
         let bytes = Array(bytes)
-        var strings: [String] = []
+        var entries: [ArraySlice<UInt8>] = []
         var index = 0
         while index < bytes.count {
             let length = Int(bytes[index])
             index += 1
             guard index + length <= bytes.count else { break }
-            strings.append(String(decoding: bytes[index ..< index + length], as: UTF8.self))
+            entries.append(bytes[index ..< index + length])
             index += length
         }
-        return decode(strings)
+        return decode(entries: entries)
+    }
+
+    private static let equalsSign = UInt8(ascii: "=")
+
+    private static func decode<Entry: Collection<UInt8>>(entries: [Entry]) -> [String: String] {
+        var records: [String: String] = [:]
+        var seen: Set<[UInt8]> = []
+        for entry in entries {
+            let separator = entry.firstIndex(of: equalsSign)
+            let key = entry[..<(separator ?? entry.endIndex)]
+            let value = separator.map { entry[entry.index(after: $0)...] } ?? entry[entry.endIndex...]
+            guard !key.isEmpty, seen.insert(key.map(asciiLowercased)).inserted else { continue }
+            records[String(decoding: key, as: UTF8.self)] = String(decoding: value, as: UTF8.self)
+        }
+        return records
+    }
+
+    private static func asciiLowercased(_ byte: UInt8) -> UInt8 {
+        (UInt8(ascii: "A") ... UInt8(ascii: "Z")).contains(byte) ? byte | 0x20 : byte
     }
 }
 
