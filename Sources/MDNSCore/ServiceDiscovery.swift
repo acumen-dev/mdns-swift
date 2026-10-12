@@ -110,6 +110,19 @@ public struct NetworkAddress: Sendable, Hashable {
     }
 }
 
+// MARK: - ResolvedService
+
+/// A resolved DNS-SD service instance: where to connect, plus its TXT record.
+public struct ResolvedService: Sendable, Hashable {
+    public let address: NetworkAddress
+    public let txtRecords: [String: String]
+
+    public init(address: NetworkAddress, txtRecords: [String: String] = [:]) {
+        self.address = address
+        self.txtRecords = txtRecords
+    }
+}
+
 // MARK: - ServiceDiscovery
 
 /// Platform-agnostic mDNS/DNS-SD service discovery protocol.
@@ -133,6 +146,9 @@ public protocol ServiceDiscovery: Sendable {
     /// Resolve a discovered service record to a network address.
     func resolve(_ record: ServiceRecord) async throws -> NetworkAddress
 
+    /// Resolves an instance to its address and TXT record.
+    func resolveService(_ record: ServiceRecord) async throws -> ResolvedService
+
     /// Stop all active advertisements.
     func stopAdvertising() async
 
@@ -144,5 +160,11 @@ extension ServiceDiscovery {
     /// Default implementation: stop all advertisements.
     public func stopAdvertising(name: String) async {
         await stopAdvertising()
+    }
+
+    /// Default for conformers that predate TXT resolution: address only,
+    /// plus whatever TXT the browse result carried.
+    public func resolveService(_ record: ServiceRecord) async throws -> ResolvedService {
+        ResolvedService(address: try await resolve(record), txtRecords: record.txtRecords)
     }
 }

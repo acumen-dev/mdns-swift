@@ -97,3 +97,43 @@ struct NetworkAddressTests {
         #expect(set.count == 1)
     }
 }
+
+@Suite("ResolvedService Tests")
+struct ResolvedServiceTests {
+
+    /// A conformer that predates `resolveService` and implements only `resolve`.
+    private struct AddressOnlyDiscovery: ServiceDiscovery {
+        let address: NetworkAddress
+        func advertise(service: ServiceRecord) async throws {}
+        func browse(serviceType: ServiceType) -> AsyncStream<ServiceRecord> {
+            AsyncStream { $0.finish() }
+        }
+        func resolve(_ record: ServiceRecord) async throws -> NetworkAddress { address }
+        func stopAdvertising() async {}
+    }
+
+    @Test("Default resolveService returns the resolved address and the record's TXT")
+    func defaultResolveService() async throws {
+        let address = NetworkAddress(host: "fe80::1", port: 5540)
+        let discovery = AddressOnlyDiscovery(address: address)
+        let record = ServiceRecord(
+            name: "Instance",
+            serviceType: "_test._udp",
+            host: "",
+            port: 0,
+            txtRecords: ["D": "1234", "CM": "1"]
+        )
+        let resolved = try await discovery.resolveService(record)
+        #expect(resolved.address == address)
+        #expect(resolved.txtRecords == ["D": "1234", "CM": "1"])
+    }
+
+    @Test("ResolvedService defaults to empty TXT and is Hashable")
+    func resolvedServiceDefaults() {
+        let a = ResolvedService(address: NetworkAddress(host: "::1", port: 1))
+        let b = ResolvedService(address: NetworkAddress(host: "::1", port: 1), txtRecords: [:])
+        #expect(a.txtRecords.isEmpty)
+        #expect(a == b)
+        #expect(Set([a, b]).count == 1)
+    }
+}

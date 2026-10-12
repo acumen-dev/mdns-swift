@@ -103,6 +103,32 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         return out
     }
 
+    /// Decode an RFC 6763 TXT record (as delivered by `DNSServiceResolve`)
+    /// into key/value pairs — the inverse of ``txtRecordData(_:)``.
+    ///
+    /// `key=value` and `key=` (empty value) are kept; a bare `key` with no
+    /// `=` carries no value and is dropped, as is any entry that is not
+    /// valid UTF-8 or overruns the buffer.
+    static func txtRecords(from data: Data) -> [String: String] {
+        var records: [String: String] = [:]
+        let bytes = [UInt8](data)
+        var index = 0
+        while index < bytes.count {
+            let length = Int(bytes[index])
+            index += 1
+            guard index + length <= bytes.count else { break }
+            let entry = bytes[index ..< index + length]
+            index += length
+            guard let separator = entry.firstIndex(of: UInt8(ascii: "=")),
+                  let key = String(bytes: entry[entry.startIndex ..< separator], encoding: .utf8),
+                  !key.isEmpty,
+                  let value = String(bytes: entry[(separator + 1)...], encoding: .utf8)
+            else { continue }
+            records[key] = value
+        }
+        return records
+    }
+
     // MARK: - ServiceDiscovery
 
     public func advertise(service: ServiceRecord) async throws {
@@ -202,7 +228,11 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
     }
 
     public func browse(serviceType: ServiceType) -> AsyncStream<ServiceRecord> {
-        let descriptor = NWBrowser.Descriptor.bonjour(type: serviceType.rawValue, domain: "local.")
+        // `bonjourWithTXTRecord` so each result's metadata carries the
+        // instance's TXT; plain `.bonjour` reports names with empty metadata.
+        // Every change re-walks all results, so an instance whose TXT changes
+        // is yielded again with the new TXT.
+        let descriptor = NWBrowser.Descriptor.bonjourWithTXTRecord(type: serviceType.rawValue, domain: "local.")
         let browser = NWBrowser(for: descriptor, using: .udp)
 
         return AsyncStream { continuation in
@@ -345,6 +375,44 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
                     connection.cancel()
                     throw ServiceDiscoveryError.resolveFailed(recordName)
                 }
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
+    }
+
+    /// Resolves an instance to its address (via ``resolve(_:)``) and TXT.
+    ///
+    /// The TXT comes from `record` when it carries one — a browse result
+    /// does. Otherwise it is looked up with `DNSServiceResolve`, bounded by
+    /// ``txtResolveTimeout``; if that lookup gets no answer the call throws
+    /// rather than returning an empty TXT.
+    public func resolveService(_ record: ServiceRecord) async throws -> ResolvedService {
+        let address = try await resolve(record)
+        if !record.txtRecords.isEmpty {
+            return ResolvedService(address: address, txtRecords: record.txtRecords)
+        }
+        let txt = try await resolveTXT(record, timeout: Self.txtResolveTimeout)
+        return ResolvedService(address: address, txtRecords: txt)
+    }
+
+    /// How long the `DNSServiceResolve` TXT lookup in ``resolveService(_:)``
+    /// gets. The same bound the address resolve puts on its first attempt
+    /// (``ipv4PreferenceTimeout``).
+    static let txtResolveTimeout: Duration = ipv4PreferenceTimeout
+
+    /// Look up an instance's TXT record with `DNSServiceResolve`, throwing
+    /// ``ServiceDiscoveryError/resolveFailed(_:)`` if no answer arrives
+    /// within `timeout`.
+    func resolveTXT(_ record: ServiceRecord, timeout: Duration) async throws -> [String: String] {
+        let lookup = TXTLookup(queue: queue)
+        let name = record.name
+        let type = record.serviceType.rawValue
+        return try await withThrowingTaskGroup(of: [String: String].self) { group in
+            group.addTask { try await lookup.run(name: name, type: type) }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw ServiceDiscoveryError.resolveFailed(name)
             }
             defer { group.cancelAll() }
             return try await group.next()!
@@ -758,6 +826,134 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
             port: 0,
             txtRecords: txtRecords
         )
+    }
+}
+
+// MARK: - TXT Lookup
+
+/// One `DNSServiceResolve` lookup, bridged to async.
+///
+/// The reply callback is a C function pointer, so it reaches this object
+/// through a retained context pointer. Whichever of the reply, a failure or
+/// cancellation arrives first wins (`finished`); it resumes the continuation
+/// and, if the ref was started, deallocates it **on the ref's dispatch queue**
+/// — so no reply can run concurrently with, or after, deallocation — before
+/// releasing the context.
+private final class TXTLookup: @unchecked Sendable {
+
+    // `continuation`, `ref` and `finished` are guarded by `lock`.
+    private let lock = NSLock()
+    private let queue: DispatchQueue
+    private var continuation: CheckedContinuation<[String: String], Error>?
+    private var ref: DNSServiceRef?
+    private var finished = false
+    private var name = ""
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+    }
+
+    func run(name: String, type: String) async throws -> [String: String] {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[String: String], Error>) in
+                lock.lock()
+                if finished {
+                    lock.unlock()
+                    cont.resume(throwing: CancellationError())
+                    return
+                }
+                continuation = cont
+                self.name = name
+                lock.unlock()
+                start(name: name, type: type)
+            }
+        } onCancel: {
+            finish(.failure(CancellationError()))
+        }
+    }
+
+    private func start(name: String, type: String) {
+        let context = Unmanaged.passRetained(self)
+        var sdRef: DNSServiceRef?
+        let err = DNSServiceResolve(
+            &sdRef,
+            0,          // flags
+            0,          // any interface
+            name,
+            type,
+            "local.",
+            TXTLookup.reply,
+            context.toOpaque()
+        )
+        guard err == kDNSServiceErr_NoError, let sdRef else {
+            context.release()
+            finish(.failure(ServiceDiscoveryError.resolveFailed(name)))
+            return
+        }
+
+        lock.lock()
+        if finished {
+            // Cancelled before the ref was published; nothing is scheduled
+            // on a queue yet, so it can be deallocated here.
+            lock.unlock()
+            DNSServiceRefDeallocate(sdRef)
+            context.release()
+            return
+        }
+        // Schedule before publishing, so `finish` never deallocates a ref
+        // that is still being attached to the queue.
+        DNSServiceSetDispatchQueue(sdRef, queue)
+        ref = sdRef
+        lock.unlock()
+    }
+
+    fileprivate func finish(_ result: Result<[String: String], Error>) {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let cont = continuation
+        continuation = nil
+        let started = ref != nil
+        lock.unlock()
+
+        cont?.resume(with: result)
+
+        if started {
+            queue.async {
+                self.deallocateRef()
+                Unmanaged.passUnretained(self).release()
+            }
+        }
+    }
+
+    private func deallocateRef() {
+        lock.lock()
+        let sdRef = ref
+        ref = nil
+        lock.unlock()
+        if let sdRef {
+            DNSServiceRefDeallocate(sdRef)
+        }
+    }
+
+    private static let reply: DNSServiceResolveReply = { _, _, _, errorCode, _, _, _, txtLen, txtRecord, context in
+        guard let context else { return }
+        let lookup = Unmanaged<TXTLookup>.fromOpaque(context).takeUnretainedValue()
+        guard errorCode == kDNSServiceErr_NoError else {
+            lookup.finish(.failure(ServiceDiscoveryError.resolveFailed(lookup.currentName)))
+            return
+        }
+        let data = txtRecord.map { Data(bytes: $0, count: Int(txtLen)) } ?? Data()
+        lookup.finish(.success(AppleServiceDiscovery.txtRecords(from: data)))
+    }
+
+    private var currentName: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return name
     }
 }
 
