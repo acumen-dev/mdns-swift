@@ -137,3 +137,61 @@ struct ResolvedServiceTests {
         #expect(Set([a, b]).count == 1)
     }
 }
+
+@Suite("TXTRecord decoding (RFC 6763 §6)")
+struct TXTRecordDecodeTests {
+
+    @Test("key=value, key= and bare key")
+    func valueForms() {
+        #expect(TXTRecord.decode(["a=1", "b=", "c"]) == ["a": "1", "b": "", "c": ""])
+    }
+
+    @Test("Only the first '=' separates key from value")
+    func valueContainsEquals() {
+        #expect(TXTRecord.decode(["k=a=b"]) == ["k": "a=b"])
+    }
+
+    @Test("Duplicate keys: the first occurrence wins, compared case-insensitively")
+    func duplicates() {
+        #expect(TXTRecord.decode(["D=1", "D=2"]) == ["D": "1"])
+        #expect(TXTRecord.decode(["D=1", "d=2"]) == ["D": "1"])
+        #expect(TXTRecord.decode(["flag", "flag=x"]) == ["flag": ""])
+    }
+
+    @Test("Keys are preserved as received")
+    func keyCasePreserved() {
+        #expect(TXTRecord.decode(["Sii=5000"]) == ["Sii": "5000"])
+    }
+
+    @Test("Empty strings and strings with no key are ignored")
+    func emptyAndKeyless() {
+        #expect(TXTRecord.decode([""]) == [:])
+        #expect(TXTRecord.decode([]) == [:])
+        #expect(TXTRecord.decode(["=x", "", "a=1"]) == ["a": "1"])
+    }
+
+    @Test("Wire format: length-prefixed strings decode by the same rule")
+    func wireFormat() {
+        var bytes: [UInt8] = []
+        for entry in ["D=1234", "flag", "D=9"] {
+            bytes.append(UInt8(entry.utf8.count))
+            bytes.append(contentsOf: entry.utf8)
+        }
+        #expect(TXTRecord.decode(wireFormat: bytes) == ["D": "1234", "flag": ""])
+    }
+
+    @Test("Wire format: a single empty string decodes to empty TXT")
+    func wireFormatSingleEmptyString() {
+        #expect(TXTRecord.decode(wireFormat: [0]) == [:])
+        #expect(TXTRecord.decode(wireFormat: [UInt8]()) == [:])
+    }
+
+    @Test("Wire format: an entry overrunning the buffer ends decoding")
+    func wireFormatTruncated() {
+        var bytes: [UInt8] = [3]
+        bytes.append(contentsOf: "a=1".utf8)
+        bytes.append(10)
+        bytes.append(contentsOf: "b=2".utf8)
+        #expect(TXTRecord.decode(wireFormat: bytes) == ["a": "1"])
+    }
+}

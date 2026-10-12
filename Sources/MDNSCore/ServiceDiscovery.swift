@@ -123,6 +123,57 @@ public struct ResolvedService: Sendable, Hashable {
     }
 }
 
+// MARK: - TXTRecord
+
+/// DNS-SD TXT record decoding (RFC 6763 §6), shared by every platform
+/// implementation so browse and resolve results follow one rule:
+///
+/// - `key=value` → `value`; `key=` → `""`; a bare `key` (no `=`) → `""`.
+/// - Empty strings, and strings beginning with `=` (no key), are ignored —
+///   so a TXT record holding a single empty string decodes to `[:]`.
+/// - Keys are kept as received. Keys compare case-insensitively (§6.4), and
+///   when a key repeats, the first occurrence wins.
+public enum TXTRecord {
+
+    /// Decode TXT character-strings, in the order received.
+    public static func decode(_ strings: [String]) -> [String: String] {
+        var records: [String: String] = [:]
+        var seen: Set<String> = []
+        for string in strings {
+            let key: Substring
+            let value: Substring
+            if let separator = string.firstIndex(of: "=") {
+                key = string[..<separator]
+                value = string[string.index(after: separator)...]
+            } else {
+                key = string[...]
+                value = ""
+            }
+            guard !key.isEmpty, seen.insert(key.lowercased()).inserted else { continue }
+            records[String(key)] = String(value)
+        }
+        return records
+    }
+
+    /// Decode a TXT record in wire format: a sequence of character-strings,
+    /// each a length byte followed by that many bytes. An entry that overruns
+    /// the buffer ends decoding. Values are decoded as UTF-8, with invalid
+    /// sequences replaced rather than dropping the key.
+    public static func decode(wireFormat bytes: some Collection<UInt8>) -> [String: String] {
+        let bytes = Array(bytes)
+        var strings: [String] = []
+        var index = 0
+        while index < bytes.count {
+            let length = Int(bytes[index])
+            index += 1
+            guard index + length <= bytes.count else { break }
+            strings.append(String(decoding: bytes[index ..< index + length], as: UTF8.self))
+            index += length
+        }
+        return decode(strings)
+    }
+}
+
 // MARK: - ServiceDiscovery
 
 /// Platform-agnostic mDNS/DNS-SD service discovery protocol.
@@ -147,6 +198,9 @@ public protocol ServiceDiscovery: Sendable {
     func resolve(_ record: ServiceRecord) async throws -> NetworkAddress
 
     /// Resolves an instance to its address and TXT record.
+    ///
+    /// `txtRecords` is empty when the instance's TXT could not be obtained;
+    /// address resolution failure throws.
     func resolveService(_ record: ServiceRecord) async throws -> ResolvedService
 
     /// Stop all active advertisements.

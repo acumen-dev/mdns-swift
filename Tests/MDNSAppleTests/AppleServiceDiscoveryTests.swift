@@ -10,6 +10,7 @@ import MDNSCore
 // test-only service type (so they never surface in a real browse).
 
 #if canImport(Network)
+import Network
 @testable import MDNSApple
 
 @Suite("AppleServiceDiscovery Compile-time Tests")
@@ -56,37 +57,27 @@ struct TXTRecordEncodingTests {
         #expect(data.first == 255)
     }
 }
-@Suite("TXT Record Decoding")
-struct TXTRecordDecodingTests {
+@Suite("Apple TXT bytes follow the shared RFC 6763 rule")
+struct AppleTXTDecodingTests {
 
-    @Test("Decoding inverts encoding")
-    func roundTrip() {
+    @Test("The encoder's output decodes back to the same TXT")
+    func encoderRoundTrip() {
         let records = ["D": "1234", "CM": "1", "SII": "5000"]
         let data = AppleServiceDiscovery.txtRecordData(records)
-        #expect(AppleServiceDiscovery.txtRecords(from: data) == records)
+        #expect(TXTRecord.decode(wireFormat: data) == records)
     }
 
-    @Test("Key with '=' and no value decodes as empty; bare key is dropped")
-    func emptyAndBareKeys() {
-        var data = Data()
-        data.append(2)
-        data.append(contentsOf: Array("a=".utf8))
-        data.append(1)
-        data.append(contentsOf: Array("b".utf8))
-        #expect(AppleServiceDiscovery.txtRecords(from: data) == ["a": ""])
-    }
-
-    @Test("Truncated entry is ignored")
-    func truncated() {
-        var data = Data()
-        data.append(10)
-        data.append(contentsOf: Array("a=1".utf8))
-        #expect(AppleServiceDiscovery.txtRecords(from: data).isEmpty)
-    }
-
-    @Test("Empty data decodes as empty TXT")
-    func empty() {
-        #expect(AppleServiceDiscovery.txtRecords(from: Data()).isEmpty)
+    /// Browse decodes `NWTXTRecord.data`; this pins that those bytes keep
+    /// what the rule needs (bare keys, duplicate order).
+    @Test("NWTXTRecord.data keeps bare keys and duplicate order for the shared rule")
+    func nwTXTRecordBytes() {
+        var wire = Data()
+        for entry in ["D=1234", "flag", "e=", "D=9999"] {
+            wire.append(UInt8(entry.utf8.count))
+            wire.append(contentsOf: Array(entry.utf8))
+        }
+        let record = NWTXTRecord(wire)
+        #expect(TXTRecord.decode(wireFormat: record.data) == ["D": "1234", "flag": "", "e": ""])
     }
 }
 
@@ -233,7 +224,7 @@ struct AppleServiceDiscoveryLiveTests {
         }
     }
 
-    @Test("TXT lookup for an absent instance throws when its timeout elapses")
+    @Test("resolveTXT for an absent instance throws when its timeout elapses")
     func txtLookupTimesOut() async throws {
         let discovery = AppleServiceDiscovery()
         let absent = ServiceRecord(
@@ -245,6 +236,55 @@ struct AppleServiceDiscoveryLiveTests {
         await #expect(throws: ServiceDiscoveryError.self) {
             try await Self.withHangGuard("resolveTXT(absent)") {
                 try await discovery.resolveTXT(absent, timeout: .milliseconds(1))
+            }
+        }
+    }
+
+    @Test("resolveService returns the address with empty TXT when the TXT can't be obtained")
+    func resolveServiceWithoutTXT() async throws {
+        let discovery = AppleServiceDiscovery()
+        let record = Self.makeRecord()
+        try await Self.withAdvertised(discovery, record) {
+            let bare = ServiceRecord(name: record.name, serviceType: Self.serviceType, host: "", port: 0)
+            let resolved = try await Self.withHangGuard("resolveService(TXT unavailable)") {
+                try await discovery.resolveService(bare) { record in
+                    throw ServiceDiscoveryError.resolveFailed(record.name)
+                }
+            }
+            #expect(resolved.address.port == Self.port)
+            #expect(resolved.txtRecords.isEmpty)
+        }
+    }
+
+    @Test("browse yields an instance again when its TXT changes")
+    func browseReyieldsChangedTXT() async throws {
+        let discovery = AppleServiceDiscovery()
+        let original = Self.makeRecord()
+        let changedTXT = ["D": "1234", "CM": "0", "SII": "5000"]
+        let changed = ServiceRecord(
+            name: original.name,
+            serviceType: Self.serviceType,
+            host: "",
+            port: Self.port,
+            txtRecords: changedTXT,
+            advertiseOnAllInterfaces: true
+        )
+        try await Self.withAdvertised(discovery, original) {
+            try await Self.withHangGuard("browse re-yield on TXT change") {
+                var readvertised = false
+                var lastSeen: [String: String]?
+                for await record in discovery.browse(serviceType: Self.serviceType) where record.name == original.name {
+                    lastSeen = record.txtRecords
+                    if !readvertised, record.txtRecords == Self.txt {
+                        readvertised = true
+                        try await discovery.advertise(service: changed)
+                    } else if readvertised, record.txtRecords == changedTXT {
+                        return
+                    }
+                }
+                throw HangGuardExpired(
+                    description: "browse ended before the changed TXT; readvertised=\(readvertised) lastSeen=\(String(describing: lastSeen))"
+                )
             }
         }
     }
