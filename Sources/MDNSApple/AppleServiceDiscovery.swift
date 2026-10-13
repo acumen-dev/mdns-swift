@@ -279,6 +279,7 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         ) {
             return address
         }
+        try Task.checkCancellation()
 
         return try await resolveOnce(endpoint: endpoint, parameters: .udp, recordName: record.name, timeout: nil)
     }
@@ -297,56 +298,60 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
 
         return try await withThrowingTaskGroup(of: NetworkAddress.self) { group in
             group.addTask {
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<NetworkAddress, Error>) in
-                    nonisolated(unsafe) var resumed = false
-                    connection.stateUpdateHandler = { [weak self] state in
-                        guard let self else { return }
-                        guard !resumed else { return }
-                        switch state {
-                        case .ready:
-                            // A `fallbackHostname` matters even here, not
-                            // just in the caller's own resolve-failure
-                            // fallback: a scoped host still carries a
-                            // correctly-resolved port from this same SRV
-                            // lookup, which mDNS *browsing* alone never
-                            // provides (`ServiceRecord.port` is `0` until
-                            // something resolves it) — losing that port by
-                            // treating a scoped host as a hard failure would
-                            // just move the same "not a valid URL" problem
-                            // from a bad host to a bad (`0`) port.
-                            if let remoteEndpoint = connection.currentPath?.remoteEndpoint,
-                               let address = NetworkAddress(
-                                   endpoint: remoteEndpoint,
-                                   fallbackHostname: "\(recordName).local"
-                               ) {
-                                resumed = true
-                                cont.resume(returning: address)
-                            } else {
-                                resumed = true
-                                cont.resume(throwing: ServiceDiscoveryError.resolveFailed(recordName))
+                let outcome = ResolveOutcome()
+                // `onCancel` resumes the continuation itself rather than
+                // waiting for the connection's `.cancelled` state: a
+                // connection cancelled before (or racing with) `start` need
+                // not report any state. `ResolveOutcome` resumes at most once.
+                return try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<NetworkAddress, Error>) in
+                        outcome.install(cont)
+                        connection.stateUpdateHandler = { [weak self] state in
+                            guard let self else { return }
+                            switch state {
+                            case .ready:
+                                // A `fallbackHostname` matters even here, not
+                                // just in the caller's own resolve-failure
+                                // fallback: a scoped host still carries a
+                                // correctly-resolved port from this same SRV
+                                // lookup, which mDNS *browsing* alone never
+                                // provides (`ServiceRecord.port` is `0` until
+                                // something resolves it) — losing that port by
+                                // treating a scoped host as a hard failure would
+                                // just move the same "not a valid URL" problem
+                                // from a bad host to a bad (`0`) port.
+                                if let remoteEndpoint = connection.currentPath?.remoteEndpoint,
+                                   let address = NetworkAddress(
+                                       endpoint: remoteEndpoint,
+                                       fallbackHostname: "\(recordName).local"
+                                   ) {
+                                    outcome.finish(.success(address))
+                                } else {
+                                    outcome.finish(.failure(ServiceDiscoveryError.resolveFailed(recordName)))
+                                }
+                                connection.cancel()
+                            case .failed(let error):
+                                self.logger.error("Resolve failed for '\(recordName)': \(error)")
+                                outcome.finish(.failure(error))
+                                connection.cancel()
+                            case .cancelled:
+                                outcome.finish(.failure(CancellationError()))
+                            default:
+                                break
                             }
-                            connection.cancel()
-                        case .failed(let error):
-                            self.logger.error("Resolve failed for '\(recordName)': \(error)")
-                            resumed = true
-                            cont.resume(throwing: error)
-                            connection.cancel()
-                        case .cancelled:
-                            if !resumed {
-                                resumed = true
-                                cont.resume(throwing: CancellationError())
-                            }
-                        default:
-                            break
                         }
+                        connection.start(queue: self.queue)
                     }
-                    connection.start(queue: self.queue)
+                } onCancel: {
+                    outcome.cancel()
+                    connection.cancel()
                 }
             }
             if let timeout {
                 group.addTask {
+                    // Cancelled sleep must still cancel the connection.
+                    defer { connection.cancel() }
                     try await Task.sleep(for: timeout)
-                    connection.cancel()
                     throw ServiceDiscoveryError.resolveFailed(recordName)
                 }
             }
@@ -825,4 +830,47 @@ public enum ServiceDiscoveryError: Error, Sendable {
     case resolveFailed(String)
     case registrationFailed(code: Int)
 }
+
+// MARK: - ResolveOutcome
+
+/// Resumes one `resolveOnce` continuation exactly once, from whichever of the
+/// connection's state handler or task cancellation gets there first.
+private final class ResolveOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<NetworkAddress, Error>?
+    private var cancelledEarly = false
+    private var finished = false
+
+    func install(_ continuation: CheckedContinuation<NetworkAddress, Error>) {
+        lock.lock()
+        if finished || cancelledEarly {
+            finished = true
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+        } else {
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    func finish(_ result: Result<NetworkAddress, Error>) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        let first = !finished
+        finished = true
+        lock.unlock()
+        if first, let pending { pending.resume(with: result) }
+    }
+
+    func cancel() {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        if pending == nil { cancelledEarly = true } else { finished = true }
+        lock.unlock()
+        pending?.resume(throwing: CancellationError())
+    }
+}
+
 #endif

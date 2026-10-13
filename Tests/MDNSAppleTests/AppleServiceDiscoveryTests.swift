@@ -224,6 +224,67 @@ struct AppleServiceDiscoveryLiveTests {
         }
     }
 
+    /// Runs `operation` in its own task, cancels it once it has started, and
+    /// reports whether it returned before `guardDuration`. The wait on the
+    /// task is a cancellable stream read, so an operation that ignores
+    /// cancellation fails this check instead of hanging the test.
+    private static func returnsAfterCancel(
+        guardDuration: Duration = hangGuard,
+        _ operation: @escaping @Sendable () async throws -> Void
+    ) async -> Bool {
+        let (finished, signal) = AsyncStream<Void>.makeStream()
+        let task = Task {
+            defer { signal.finish() }
+            do { try await operation() } catch {}
+        }
+        // Long enough for the operation to be in flight; the assertion is only
+        // that it returns, not when.
+        try? await Task.sleep(for: .milliseconds(100))
+        task.cancel()
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await _ in finished {}
+                return !Task.isCancelled
+            }
+            group.addTask {
+                try? await Task.sleep(for: guardDuration)
+                return false
+            }
+            defer { group.cancelAll() }
+            return await group.next()!
+        }
+    }
+
+    @Test("cancelling resolve of an absent instance returns instead of hanging")
+    func resolveHonoursCancellation() async {
+        let discovery = AppleServiceDiscovery()
+        let absent = ServiceRecord(
+            name: "mdnstest-absent-\(UUID().uuidString)",
+            serviceType: Self.serviceType,
+            host: "",
+            port: 0
+        )
+        let returned = await Self.returnsAfterCancel {
+            _ = try await discovery.resolve(absent)
+        }
+        #expect(returned, "resolve did not return after cancellation")
+    }
+
+    @Test("cancelling resolveService of an absent instance returns instead of hanging")
+    func resolveServiceHonoursCancellation() async {
+        let discovery = AppleServiceDiscovery()
+        let absent = ServiceRecord(
+            name: "mdnstest-absent-\(UUID().uuidString)",
+            serviceType: Self.serviceType,
+            host: "",
+            port: 0
+        )
+        let returned = await Self.returnsAfterCancel {
+            _ = try await discovery.resolveService(absent)
+        }
+        #expect(returned, "resolveService did not return after cancellation")
+    }
+
     @Test("resolveTXT for an absent instance throws when its timeout elapses")
     func txtLookupTimesOut() async throws {
         let discovery = AppleServiceDiscovery()
