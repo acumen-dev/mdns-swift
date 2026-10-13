@@ -1,6 +1,13 @@
 // LinuxServiceDiscovery.swift
 // Copyright 2026 Monagle Pty Ltd
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
 import Foundation
 import NIOCore
 import NIOPosix
@@ -505,13 +512,15 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
     /// heard after an AAAA record still sorts first.
     ///
     /// An AAAA record's 16 raw bytes are formatted as a bracketed IPv6
-    /// literal (`"[fe80:0:0:0:1234:5678:9abc:def0]"`) — RFC 3986 requires
+    /// literal (`"[fe80::1234:5678:9abc:def0]"`) — RFC 3986 requires
     /// the brackets; a bare colon-separated literal is not a valid URL host
     /// and previously broke `URLComponents`-based transports downstream
     /// (see the sibling fix in `MDNSApple`'s `NetworkAddress(endpoint:)`).
-    /// No zero-run compression (`::`) — verbose but unambiguous, and this
-    /// hand-rolled parser has no need to match `nw_path`/`getnameinfo`'s
-    /// exact canonical form.
+    /// The literal is `inet_ntop`'s canonical compressed form (RFC 5952:
+    /// lowercase, no leading zeros, the longest zero run as `::`) — the text
+    /// the socket layer reports for a datagram's sender and Network.framework
+    /// writes on Apple platforms, so a consumer that keys by the host string
+    /// sees one form for one address.
     ///
     /// Rdata decoded off the wire is a `Data` slice of the whole message,
     /// whose indices do not start at 0, so the bytes are copied to an array
@@ -528,13 +537,20 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
         }
         for record in records {
             guard case .aaaa(let data) = record.rdata, data.count == 16 else { continue }
-            let bytes = Array(data)
-            let groups = stride(from: 0, to: 16, by: 2).map { i in
-                String(format: "%x", UInt16(bytes[i]) << 8 | UInt16(bytes[i + 1]))
-            }
-            results.append((record.name, "[\(groups.joined(separator: ":"))]"))
+            guard let literal = ipv6Literal(Array(data)) else { continue }
+            results.append((record.name, "[\(literal)]"))
         }
         return results
+    }
+
+    /// 16 address bytes in `inet_ntop`'s canonical compressed form.
+    private static func ipv6Literal(_ bytes: [UInt8]) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        let written = bytes.withUnsafeBytes { address in
+            inet_ntop(AF_INET6, address.baseAddress, &buffer, socklen_t(buffer.count))
+        }
+        guard written != nil else { return nil }
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     private func handleQuery(_ msg: DNSMessage) {

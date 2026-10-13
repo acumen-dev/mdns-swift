@@ -93,7 +93,7 @@ The contract for both:
 `NetworkAddress.host` is one of:
 
 - an IPv4 dotted quad (`"192.0.2.10"`);
-- a bracketed IPv6 literal (`"[fd00::1]"`) — the RFC 3986 URL-host form. Strip the brackets before handing it to a socket API (`inet_pton`, `getaddrinfo`, NIO's `SocketAddress(ipAddress:port:)`). The text is not canonical (`MDNSLinux` writes every group in full), so compare parsed addresses;
+- a bracketed IPv6 literal (`"[fd00::1]"`) — the RFC 3986 URL-host form. Strip the brackets before handing it to a socket API (`inet_pton`, `getaddrinfo`, NIO's `SocketAddress(ipAddress:port:)`). Both backends write the canonical compressed form `inet_ntop` produces (RFC 5952), the form the socket layer reports for a datagram's sender;
 - on Apple platforms, `"<instance>.local"` when the resolved address is interface-scoped (scoped IPv6, typically link-local, or scoped IPv4 link-local), since the scope cannot travel in a portable string. The port is still the resolved one.
 
 `MDNSLinux` carries no interface scope; a link-local address comes back as an unscoped literal.

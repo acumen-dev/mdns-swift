@@ -19,6 +19,11 @@ import Foundation
 ///    library prefers IPv4 throughout (see `MDNSApple`'s equivalent
 ///    preference in `AppleServiceDiscovery.resolve`); the Linux backend
 ///    should not have been the odd one out.
+/// 3. An AAAA record was written with every group in full
+///    (`"[fd00:0:0:0:0:0:0:1]"`), where the socket layer and Network.framework
+///    write the canonical compressed form (`"[fd00::1]"`); a consumer that
+///    matched a reply's sender against the resolved host by string never saw
+///    the reply.
 @Suite("LinuxServiceDiscovery.resolvableHosts — A/AAAA formatting and ordering")
 struct LinuxServiceDiscoveryResolveTests {
     @Test("an A record formats as a plain, URL-safe dotted-quad host")
@@ -37,7 +42,23 @@ struct LinuxServiceDiscoveryResolveTests {
         let record = DNSRecord(name: "shelly1pmg4-abc123.local", type: .aaaa, ttl: 120, rdata: .aaaa(bytes))
         let results = LinuxServiceDiscovery.resolvableHosts(from: [record])
         #expect(results.count == 1)
-        #expect(results[0].host == "[fe80:0:0:0:1234:5678:9abc:def0]")
+        #expect(results[0].host == "[fe80::1234:5678:9abc:def0]")
+        try #require(urlBuilds(fromHost: results[0].host))
+    }
+
+    @Test(
+        "an AAAA record formats in the canonical compressed form (RFC 5952), as inet_ntop writes it",
+        arguments: [
+            ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], "[::1]"),
+            ([0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05], "[fd00::5]"),
+            ([0xfd, 0, 0, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0x0b, 0, 0, 0, 0], "[fd00:a::b:0:0]"),
+            ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "[::]"),
+        ] as [([UInt8], String)]
+    )
+    func aaaaRecordFormatsCompressed(bytes: [UInt8], host: String) throws {
+        let record = DNSRecord(name: "host-1.local", type: .aaaa, ttl: 120, rdata: .aaaa(Data(bytes)))
+        let results = LinuxServiceDiscovery.resolvableHosts(from: [record])
+        #expect(results.map(\.host) == [host])
         try #require(urlBuilds(fromHost: results[0].host))
     }
 
@@ -56,7 +77,7 @@ struct LinuxServiceDiscoveryResolveTests {
 
         #expect(results.count == 2)
         #expect(results[0].host == "192.168.1.23") // A wins the race regardless of input order
-        #expect(results[1].host == "[fe80:0:0:0:1234:5678:9abc:def0]")
+        #expect(results[1].host == "[fe80::1234:5678:9abc:def0]")
     }
 
     @Test("malformed byte counts are skipped rather than producing a garbled host")
@@ -81,7 +102,7 @@ struct LinuxServiceDiscoveryResolveTests {
         ])
         let decoded = try #require(DNSMessage.decode(from: message.encode()))
         let hosts = LinuxServiceDiscovery.resolvableHosts(from: decoded.answers).map(\.host)
-        #expect(hosts == ["192.0.2.1", "[fe80:0:0:0:1234:5678:9abc:def0]"])
+        #expect(hosts == ["192.0.2.1", "[fe80::1234:5678:9abc:def0]"])
     }
 
     private func urlBuilds(fromHost host: String) -> Bool {

@@ -139,13 +139,13 @@ struct DNSSDCacheTests {
             DNSRecord(name: "host-1.local", type: .aaaa, ttl: 120, rdata: .aaaa(v6)),
             DNSRecord(name: "host-1.local", type: .a, ttl: 120, rdata: .a(Data([192, 0, 2, 1]))),
         ]), now: .now)
-        #expect(cache.addresses(host: "host-1.local") == ["192.0.2.1", "[fe80:0:0:0:1234:5678:9abc:def0]"])
+        #expect(cache.addresses(host: "host-1.local") == ["192.0.2.1", "[fe80::1234:5678:9abc:def0]"])
 
         // A goodbye for one address removes only that address.
         cache.ingest(try Self.wire([
             DNSRecord(name: "host-1.local", type: .a, ttl: 0, rdata: .a(Data([192, 0, 2, 1]))),
         ]), now: .now)
-        #expect(cache.addresses(host: "host-1.local") == ["[fe80:0:0:0:1234:5678:9abc:def0]"])
+        #expect(cache.addresses(host: "host-1.local") == ["[fe80::1234:5678:9abc:def0]"])
     }
 
     // MARK: Cache-flush (RFC 6762 §10.2)
@@ -188,6 +188,6 @@ struct DNSSDCacheTests {
         let start = ContinuousClock.now
         cache.ingest([DNSRecord(name: "host-1.local", type: .aaaa, ttl: 120, rdata: .aaaa(v6), cacheFlush: true)], now: start)
         cache.ingest([Self.address(2, cacheFlush: true)], now: start + .seconds(2))
-        #expect(cache.addresses(host: "host-1.local") == ["192.0.2.2", "[fe80:0:0:0:1234:5678:9abc:def0]"])
+        #expect(cache.addresses(host: "host-1.local") == ["192.0.2.2", "[fe80::1234:5678:9abc:def0]"])
     }
 }

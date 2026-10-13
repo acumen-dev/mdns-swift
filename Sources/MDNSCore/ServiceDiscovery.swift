@@ -107,9 +107,10 @@ public struct ServiceRecord: Sendable {
 /// - **IPv6**: a literal in brackets (`"[fd00::1]"`), the RFC 3986 URL-host
 ///   form, so `host` drops straight into a URL authority. Socket APIs
 ///   (`inet_pton`, `getaddrinfo`, `SocketAddress(ipAddress:port:)`) reject the
-///   brackets: strip them before parsing. The literal's text is not
-///   canonical — `MDNSLinux` writes every group in full
-///   (`"[fd00:0:0:0:0:0:0:1]"`) — so compare parsed addresses, not strings.
+///   brackets: strip them before parsing. Both backends write the literal
+///   in the canonical compressed form `inet_ntop` produces (RFC 5952:
+///   `"[fd00::1]"`, never `"[fd00:0:0:0:0:0:0:1]"`), the form the socket
+///   layer reports for a datagram's sender.
 /// - **A host name** (`"<instance>.local"`): on Apple platforms, when the
 ///   resolved address is interface-scoped — an IPv6 address with a scope
 ///   (typically link-local `fe80::/10`) or a scoped IPv4 link-local address
