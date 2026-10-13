@@ -16,8 +16,10 @@ import Network
 /// `URLComponents` cannot parse at all. That broke every URL-based
 /// transport built on top of this library with a crash, not a catchable
 /// error — confirmed against real hardware, see `acumen-shelly`'s CLAUDE.md.
-/// These pin down both the rejection of scoped addresses and the URL
-/// safety of everything this initializer does still accept.
+/// These pin down what happens to scoped addresses — a routable IPv4
+/// literal is kept without its scope; a scoped IPv6 or IPv4 link-local
+/// address is replaced by the fallback hostname, or rejected without one —
+/// and the URL safety of everything this initializer does accept.
 @Suite("NetworkAddress(endpoint:) never yields a host that breaks URL construction")
 struct NetworkAddressTests {
     @Test("a plain (unscoped) IPv4 endpoint resolves to a usable, URL-safe host")
@@ -53,6 +55,32 @@ struct NetworkAddressTests {
         let address = try #require(NetworkAddress(endpoint: endpoint, fallbackHostname: "0123456789ABCDEF.local"))
         #expect(address.host == "192.0.2.104")
         #expect(address.port == 80)
+    }
+
+    @Test("a scoped IPv4 link-local endpoint is rejected without a fallback, not stripped of the scope it needs")
+    func scopedIPv4LinkLocalRejected() throws {
+        let addr = try #require(IPv4Address("169.254.10.20%lo0"))
+        #expect(addr.interface != nil)
+        #expect(addr.isLinkLocal)
+        let endpoint = NWEndpoint.hostPort(host: .ipv4(addr), port: 80)
+        #expect(NetworkAddress(endpoint: endpoint) == nil)
+    }
+
+    @Test("a scoped IPv4 link-local endpoint substitutes the fallback hostname but keeps the resolved port")
+    func scopedIPv4LinkLocalUsesFallbackHostname() throws {
+        let addr = try #require(IPv4Address("169.254.10.20%lo0"))
+        let endpoint = NWEndpoint.hostPort(host: .ipv4(addr), port: 8080)
+        let address = try #require(NetworkAddress(endpoint: endpoint, fallbackHostname: "shelly1.local"))
+        #expect(address.host == "shelly1.local")
+        #expect(address.port == 8080)
+    }
+
+    @Test("an unscoped IPv4 link-local endpoint keeps its literal")
+    func unscopedIPv4LinkLocalKeepsLiteral() throws {
+        let addr = try #require(IPv4Address("169.254.10.20"))
+        let endpoint = NWEndpoint.hostPort(host: .ipv4(addr), port: 80)
+        let address = try #require(NetworkAddress(endpoint: endpoint, fallbackHostname: "shelly1.local"))
+        #expect(address.host == "169.254.10.20")
     }
 
     @Test("a plain (unscoped) global/ULA IPv6 endpoint resolves to a bracketed, URL-safe host")

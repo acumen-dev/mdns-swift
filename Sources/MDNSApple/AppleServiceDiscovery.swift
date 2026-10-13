@@ -266,9 +266,10 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         // to end even when mDNS opportunistically announces one. If no
         // IPv4-constrained attempt succeeds in time, fall through to an
         // unconstrained attempt — whatever `currentPath.remoteEndpoint`
-        // resolves to. Either attempt can still yield a scoped address; see
-        // `resolveOnce`'s `fallbackHostname` use for why that's not a
-        // failure.
+        // resolves to. Either attempt can still yield a scoped address. A
+        // scoped routable IPv4 address comes back as its literal; a scoped
+        // IPv6 or IPv4 link-local one needs its scope, so see `resolveOnce`'s
+        // `fallbackHostname` use for why that's not a failure.
         let ipv4Parameters = NWParameters.udp
         if let ipOptions = ipv4Parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
             ipOptions.version = .v4
@@ -323,7 +324,9 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
                             case .ready:
                                 // A `fallbackHostname` matters even here, not
                                 // just in the caller's own resolve-failure
-                                // fallback: a scoped host still carries a
+                                // fallback, for a scoped IPv6 or IPv4
+                                // link-local host (a scoped routable IPv4
+                                // host is kept as its literal): it still carries a
                                 // correctly-resolved port from this same SRV
                                 // lookup, which mDNS *browsing* alone never
                                 // provides (`ServiceRecord.port` is `0` until

@@ -203,12 +203,18 @@ public protocol ServiceDiscovery: Sendable {
     func browse(serviceType: ServiceType) -> AsyncStream<ServiceRecord>
 
     /// Resolve a discovered service record to a network address.
+    ///
+    /// Must honour task cancellation: a cancelled resolve stops and throws
+    /// promptly (`CancellationError`). Resolution may otherwise wait
+    /// indefinitely for an instance that never answers, so callers bound it
+    /// by cancelling.
     func resolve(_ record: ServiceRecord) async throws -> NetworkAddress
 
     /// Resolves an instance to its address and TXT record.
     ///
     /// `txtRecords` is empty when the instance's TXT could not be obtained;
-    /// address resolution failure throws.
+    /// address resolution failure throws. Must honour task cancellation as
+    /// ``resolve(_:)`` does: callers bound it by cancelling.
     func resolveService(_ record: ServiceRecord) async throws -> ResolvedService
 
     /// Stop all active advertisements.

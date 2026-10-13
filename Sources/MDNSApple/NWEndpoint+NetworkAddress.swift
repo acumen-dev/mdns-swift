@@ -15,19 +15,26 @@ extension NetworkAddress {
     /// Only `.hostPort` endpoints are supported — returns `nil` for
     /// `.service`, `.unix`, `.url`, or other endpoint types.
     ///
-    /// An `.ipv4` address is always rendered as its bare dotted-quad
+    /// A routable `.ipv4` address is rendered as its bare dotted-quad
     /// literal, scoped or not. Network.framework attaches an interface scope
     /// whenever a resolved path is tied to a specific local interface
     /// (routine on a multi-interface host — Wi-Fi + Ethernet, a VPN, a
     /// bridge), and its string form appends a `%<interfaceName>` suffix
-    /// (`"192.168.1.23%en1"`). For IPv4 that scope is a path annotation, not
-    /// addressing: `sockaddr_in` has no scope field, so the literal alone
-    /// reaches the same host, and it is valid in a URL authority and
-    /// portable once persisted.
+    /// (`"192.168.1.23%en1"`). For a routable IPv4 address that scope is a
+    /// path annotation: `sockaddr_in` has no scope field, and the routing
+    /// table picks the interface for the literal alone. The literal is valid
+    /// in a URL authority and portable once persisted.
+    ///
+    /// An IPv4 link-local address (`169.254.0.0/16`) is the exception: it
+    /// is unique only on its link, and the unscoped `169.254` route exists
+    /// on one interface only, so without its scope the literal may go out
+    /// the wrong interface. A scoped one is treated like a scoped IPv6
+    /// address, below.
     ///
     /// Substitutes `fallbackHostname` (if provided) for an
     /// **interface-scoped** `.ipv6` address (`addr.interface != nil`,
-    /// typically link-local `fe80::/10`), whose scope *is* addressing: the
+    /// typically link-local `fe80::/10`) or scoped IPv4 link-local address,
+    /// whose scope *is* addressing: the
     /// `%<interfaceName>` suffix is not valid inside a URL authority
     /// component — `URLComponents` cannot parse it — and it is not portable
     /// even where some caller could work around that: `en0` names an
@@ -44,8 +51,8 @@ extension NetworkAddress {
     /// nothing had been resolved, loses that port along with it — producing
     /// a URL like `http://foo.local:0/rpc`, invalid for an entirely
     /// different reason than the one this fix addresses. With no
-    /// `fallbackHostname` supplied, a scoped IPv6 address is rejected
-    /// (`nil`).
+    /// `fallbackHostname` supplied, a scoped IPv6 or IPv4 link-local
+    /// address is rejected (`nil`).
     public init?(endpoint: NWEndpoint, fallbackHostname: String? = nil) {
         guard case .hostPort(let host, let port) = endpoint else {
             return nil
@@ -53,8 +60,13 @@ extension NetworkAddress {
         let hostString: String
         switch host {
         case .ipv4(let addr):
-            // From the bytes: the description carries a scope's `%<interface>`.
-            hostString = addr.rawValue.map { String($0) }.joined(separator: ".")
+            if addr.interface != nil, addr.isLinkLocal {
+                guard let fallbackHostname else { return nil }
+                hostString = fallbackHostname
+            } else {
+                // From the bytes: the description carries a scope's `%<interface>`.
+                hostString = addr.rawValue.map { String($0) }.joined(separator: ".")
+            }
         case .ipv6(let addr):
             if let fallbackHostname, addr.interface != nil {
                 hostString = fallbackHostname
