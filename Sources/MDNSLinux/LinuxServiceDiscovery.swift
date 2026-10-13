@@ -451,13 +451,20 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
     ///
     /// A question still unanswered is not asked again until its interval has
     /// passed: 1 s after the first ask, doubling with each repeat up to an
-    /// hour (RFC 6762 §5.2). Hearing an answer resets it.
+    /// hour (RFC 6762 §5.2). Hearing an answer resets it. A pending resolve's
+    /// address question is the exception: it is asked whatever the backoff
+    /// (counting as a repeat), because a resolve waits on it with a bounded
+    /// timeout, and an earlier browse's unanswered ask would otherwise
+    /// silence it — once the interval has doubled a few times, for longer
+    /// than the resolve waits.
     private func followUps(after records: [DNSRecord], now: ContinuousClock.Instant) -> [DNSQuestion] {
         var questions: [DNSQuestion] = []
-        func ask(_ name: String, _ type: DNSRecordType) {
+        func ask(_ name: String, _ type: DNSRecordType, bypassingBackoff: Bool = false) {
             let key = "\(name.dnsLowercased) \(type.rawValue)"
             let previous = followUpBackoff[key]
-            if let previous, now - previous.asked < previous.interval { return }
+            if !bypassingBackoff, let previous, now - previous.asked < previous.interval { return }
+            // A bypassing ask is not limited by the backoff: once per packet.
+            guard !questions.contains(where: { "\($0.name.dnsLowercased) \($0.type.rawValue)" == key }) else { return }
             let interval = previous.map { min($0.interval * 2, .seconds(3600)) } ?? .seconds(1)
             followUpBackoff[key] = (now, interval)
             questions.append(DNSQuestion(name: name, type: type))
@@ -479,8 +486,8 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
                     DNSSDCache.instanceName(fullName: record.name, serviceType: $0) != nil
                 }
                 guard isPending || isBrowsed, cache.addresses(host: target).isEmpty else { continue }
-                ask(target, .a)
-                ask(target, .aaaa)
+                ask(target, .a, bypassingBackoff: isPending)
+                ask(target, .aaaa, bypassingBackoff: isPending)
             default:
                 continue
             }

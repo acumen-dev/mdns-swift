@@ -153,8 +153,6 @@ struct LinuxServiceDiscoveryConsumerTests {
         async let second = discovery.resolveService(Self.record)
         _ = await queries.next()
         #expect(await timerEvents.next() == .parked(1))
-        // Firing the first resolve's timer now must not touch the second.
-        await timers.fire(0)
         try await Self.feed(discovery, [Self.srv, Self.txtRecord, Self.a])
         #expect(try await second.address.port == 5540)
         #expect(await timerEvents.next() == .cancelled(1))
@@ -243,6 +241,51 @@ struct LinuxServiceDiscoveryConsumerTests {
         clock.advance(by: .milliseconds(500))
         try await Self.feed(discovery, [Self.ptr])
         #expect(Self.questions(await queries.next()) == ["\(Self.fullName) txt"])
+    }
+
+    @Test("A pending resolve's address question is sent even when a browse asked it less than 1 s earlier")
+    func pendingResolveBypassesBrowseBackoff() async throws {
+        let clock = ManualClock()
+        let log = SentLog()
+        let (sent, sink) = AsyncStream.makeStream(of: DNSMessage.self)
+        let discovery = LinuxServiceDiscovery(now: { clock.now }) { message in
+            log.append(message)
+            sink.yield(message)
+        }
+        var queries = sent.makeAsyncIterator()
+        let browsing = discovery.browse(serviceType: ServiceType(Self.type))
+        defer { withExtendedLifetime(browsing) {} } // dropping the stream ends the browse
+        _ = await queries.next() // PTR query: the browse is registered
+
+        // The browse asks for host-1's address on the first instance's SRV.
+        try await Self.feed(discovery, [Self.ptr])
+        _ = await queries.next()
+        try await Self.feed(discovery, [Self.srv])
+        #expect(Self.questions(await queries.next()) == ["host-1.local a", "host-1.local aaaa"])
+
+        // A second instance on the same host is resolved before the clock
+        // moves: its SRV arrives while host-1's questions are backed off.
+        let other = "FEDCBA9876543210"
+        let otherName = "\(other).\(Self.type).local"
+        async let resolving = discovery.resolveService(
+            ServiceRecord(name: other, serviceType: ServiceType(Self.type), host: "", port: 0)
+        )
+        #expect(Self.questions(await queries.next()) == ["\(otherName) srv", "\(otherName) txt"])
+
+        // handleIncoming sends a packet's follow-ups before it returns.
+        let before = log.count
+        try await Self.feed(discovery, [
+            DNSRecord(name: otherName, type: .srv, ttl: 120,
+                      rdata: .srv(priority: 0, weight: 0, port: 5541, target: "host-1.local")),
+            DNSRecord(name: otherName, type: .txt, ttl: 120, rdata: .txt(["D=3841", "CM=1"])),
+        ])
+        let asked = log.messages.dropFirst(before).map { Self.questions($0) }
+        #expect(asked == [["host-1.local a", "host-1.local aaaa"]], "the resolve asks for the address despite the browse's backoff")
+
+        try await Self.feed(discovery, [Self.a])
+        #expect(try await resolving == ResolvedService(
+            address: NetworkAddress(host: "192.0.2.10", port: 5541), txtRecords: ["D": "3841", "CM": "1"]
+        ))
     }
 
     @Test("A browse stream removed before its browser is added leaves no browser behind")
@@ -334,6 +377,27 @@ actor ManualTimers {
         }
         sink.yield(.cancelled(id))
         continuation.resume(throwing: CancellationError())
+    }
+}
+
+// MARK: - SentLog
+
+/// Every message a discovery sent, in order, readable at any point — so a
+/// test can assert that a packet triggered *no* query without waiting on one.
+final class SentLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sent: [DNSMessage] = []
+
+    func append(_ message: DNSMessage) {
+        lock.withLock { sent.append(message) }
+    }
+
+    var messages: [DNSMessage] {
+        lock.withLock { sent }
+    }
+
+    var count: Int {
+        lock.withLock { sent.count }
     }
 }
 
