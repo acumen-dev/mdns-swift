@@ -308,8 +308,12 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
                 // connection cancelled racing with `start` need
                 // not report any state. `ResolveOutcome` resumes at most once.
                 return try await withTaskCancellationHandler {
-                    try await withCheckedThrowingContinuation { (cont: CheckedContinuation<NetworkAddress, Error>) in
+                    try await withCheckedThrowingContinuation { [weak self, weak connection] (cont: CheckedContinuation<NetworkAddress, Error>) in
                         outcome.install(cont)
+                        guard let self, let connection else {
+                            outcome.finish(.failure(CancellationError()))
+                            return
+                        }
                         // `connection` is captured weakly: the handler would otherwise
                         // form a cycle that only a delivered `.cancelled` breaks, and a
                         // cancel racing `start` may never deliver one.
