@@ -12,7 +12,7 @@ Shared mDNS/DNS-SD service discovery for Swift — used by [matter-swift](https:
 `mdns-swift` is a pure-Swift mDNS/DNS-SD service discovery library (RFC 6762) with platform-specific backends:
 
 - **Apple platforms** — `NWBrowser` for browsing/resolving, `DNSServiceRegister` for advertising (supports DNS-SD subtypes required by Matter commissioning)
-- **Linux** — Pure-Swift RFC 6762 responder over SwiftNIO; no system daemon dependency
+- **Linux** — Pure-Swift RFC 6762 over SwiftNIO, no system daemon dependency: a responder (advertising) and a DNS-SD consumer (browse, plus resolve to address, port and TXT)
 
 The library is intentionally protocol-agnostic. Consumers define their own service types via `ServiceType` extensions:
 
@@ -75,13 +75,36 @@ let address = try await discovery.resolve(record)
 print("Connecting to \(address.host):\(address.port)")
 ```
 
+`resolveService` returns the address together with the instance's TXT record, as a `ResolvedService`:
+
+```swift
+let resolved = try await discovery.resolveService(record)
+print("\(resolved.address.host):\(resolved.address.port) TXT \(resolved.txtRecords)")
+```
+
+The contract for both:
+
+- `txtRecords` may be empty when the instance's TXT could not be obtained; failing to resolve the address throws.
+- Both must honour task cancellation, throwing `CancellationError` promptly. A resolve may otherwise wait indefinitely for an instance that never answers, so callers bound it by cancelling.
+- A conformer that implements only `resolve` gets a default `resolveService`: the resolved address plus whatever TXT the browse result carried.
+
+#### Host forms
+
+`NetworkAddress.host` is one of:
+
+- an IPv4 dotted quad (`"192.0.2.10"`);
+- a bracketed IPv6 literal (`"[fd00::1]"`) — the RFC 3986 URL-host form. Strip the brackets before handing it to a socket API (`inet_pton`, `getaddrinfo`, NIO's `SocketAddress(ipAddress:port:)`). Both backends write the canonical compressed form `inet_ntop` produces (RFC 5952), the form the socket layer reports for a datagram's sender;
+- on Apple platforms, `"<instance>.local"` when the resolved address is interface-scoped (scoped IPv6, typically link-local, or scoped IPv4 link-local), since the scope cannot travel in a portable string. The port is still the resolved one.
+
+`MDNSLinux` carries no interface scope; a link-local address comes back as an unscoped literal.
+
 ## Module Architecture
 
 | Module | Purpose | Platforms |
 |--------|---------|-----------|
-| **MDNSCore** | `ServiceDiscovery` protocol, `ServiceRecord`, `ServiceType`, `NetworkAddress`. Zero platform dependencies. | All |
+| **MDNSCore** | `ServiceDiscovery` protocol, `ServiceRecord`, `ServiceType`, `NetworkAddress`, `ResolvedService`. Zero platform dependencies. | All |
 | **MDNSApple** | `AppleServiceDiscovery` using Network.framework + `dnssd`. | Apple only |
-| **MDNSLinux** | `LinuxServiceDiscovery` using SwiftNIO + pure-Swift RFC 6762 codec. | All (primary target: Linux) |
+| **MDNSLinux** | `LinuxServiceDiscovery` using SwiftNIO + pure-Swift RFC 6762 codec: responder and DNS-SD consumer (browse/resolve). | All (primary target: Linux) |
 
 ```
 MDNSCore
@@ -108,11 +131,11 @@ discovery.browse(serviceType: "_myservice._tcp")
 
 | Platform | Minimum Version |
 |----------|----------------|
-| macOS | 15.0 |
-| iOS | 18.0 |
-| tvOS | 18.0 |
-| watchOS | 11.0 |
-| visionOS | 2.0 |
+| macOS | 14.0 |
+| iOS | 17.0 |
+| tvOS | 17.0 |
+| watchOS | 10.0 |
+| visionOS | 1.0 |
 | Linux | Swift 6.1+ (Ubuntu 24.04 tested) |
 
 ## Dependencies

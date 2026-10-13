@@ -121,4 +121,47 @@ struct DNSMessageTests {
         let decoded = try #require(DNSMessage.decode(from: data))
         #expect(decoded.answers[0].ttl == 0)
     }
+
+    @Test("Authority records are skipped, so the additionals after them decode as additionals")
+    func authoritySectionSkipped() throws {
+        let authority = DNSRecord(name: "host-1.local", type: .a, ttl: 120, rdata: .a(Data([192, 0, 2, 99])))
+        let additional = DNSRecord(name: "host-1.local", type: .a, ttl: 120, rdata: .a(Data([192, 0, 2, 10])))
+        var data = DNSMessage(isResponse: true, answers: [authority], additionals: [additional]).encode()
+        // The encoder has no authority section; re-label the first record as
+        // one by rewriting the header counts: ANCOUNT 0, NSCOUNT 1, ARCOUNT 1.
+        data[6] = 0; data[7] = 0
+        data[8] = 0; data[9] = 1
+        data[10] = 0; data[11] = 1
+
+        let decoded = try #require(DNSMessage.decode(from: data))
+        #expect(decoded.answers.isEmpty)
+        #expect(decoded.additionals.count == 1)
+        guard case .a(let bytes) = decoded.additionals.first?.rdata else {
+            Issue.record("Expected an A record in the additionals")
+            return
+        }
+        #expect(Array(bytes) == [192, 0, 2, 10])
+    }
+
+    @Test("A TXT string that is not valid UTF-8 decodes with U+FFFD rather than being emptied")
+    func txtNonUTF8Kept() throws {
+        let record = DNSRecord(name: "i._t._udp.local", type: .txt, ttl: 120, rdata: .txt(["k=x"]))
+        var data = DNSMessage(isResponse: true, answers: [record]).encode()
+        data[data.count - 1] = 0xFF // the trailing "x"
+        let decoded = try #require(DNSMessage.decode(from: data))
+        guard case .txt(let strings) = decoded.answers.first?.rdata else {
+            Issue.record("Expected TXT rdata")
+            return
+        }
+        #expect(strings == ["k=\u{FFFD}"])
+    }
+
+    @Test("Decode carries the cache-flush bit: set on a response's records, clear on a query's")
+    func cacheFlushDecoded() throws {
+        let record = DNSRecord(name: "host-1.local", type: .a, ttl: 120, rdata: .a(Data([192, 0, 2, 1])))
+        let response = try #require(DNSMessage.decode(from: DNSMessage(isResponse: true, answers: [record]).encode()))
+        #expect(response.answers.first?.cacheFlush == true)
+        let query = try #require(DNSMessage.decode(from: DNSMessage(isResponse: false, answers: [record]).encode()))
+        #expect(query.answers.first?.cacheFlush == false)
+    }
 }

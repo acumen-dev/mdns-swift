@@ -202,7 +202,11 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
     }
 
     public func browse(serviceType: ServiceType) -> AsyncStream<ServiceRecord> {
-        let descriptor = NWBrowser.Descriptor.bonjour(type: serviceType.rawValue, domain: "local.")
+        // `bonjourWithTXTRecord` so each result's metadata carries the
+        // instance's TXT; plain `.bonjour` reports names with empty metadata.
+        // Every change re-walks all results, so an instance whose TXT changes
+        // is yielded again with the new TXT.
+        let descriptor = NWBrowser.Descriptor.bonjourWithTXTRecord(type: serviceType.rawValue, domain: "local.")
         let browser = NWBrowser(for: descriptor, using: .udp)
 
         return AsyncStream { continuation in
@@ -246,6 +250,8 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
     /// would simply hang for an IPv6-only device instead of falling back.
     static let ipv4PreferenceTimeout: Duration = .seconds(2)
 
+    /// Resolves an instance to an address. Honours task cancellation: a
+    /// cancelled resolve throws `CancellationError` promptly.
     public func resolve(_ record: ServiceRecord) async throws -> NetworkAddress {
         let endpoint = NWEndpoint.service(
             name: record.name,
@@ -260,9 +266,10 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         // to end even when mDNS opportunistically announces one. If no
         // IPv4-constrained attempt succeeds in time, fall through to an
         // unconstrained attempt — whatever `currentPath.remoteEndpoint`
-        // resolves to. Either attempt can still yield a scoped address; see
-        // `resolveOnce`'s `fallbackHostname` use for why that's not a
-        // failure.
+        // resolves to. Either attempt can still yield a scoped address. A
+        // scoped routable IPv4 address comes back as its literal; a scoped
+        // IPv6 or IPv4 link-local one needs its scope, so see `resolveOnce`'s
+        // `fallbackHostname` use for why that's not a failure.
         let ipv4Parameters = NWParameters.udp
         if let ipOptions = ipv4Parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
             ipOptions.version = .v4
@@ -275,6 +282,7 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         ) {
             return address
         }
+        try Task.checkCancellation()
 
         return try await resolveOnce(endpoint: endpoint, parameters: .udp, recordName: record.name, timeout: nil)
     }
@@ -282,7 +290,8 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
     /// One resolve attempt over one `NWConnection`, optionally bounded by
     /// `timeout` (used only for the IPv4-preference attempt — an
     /// unconstrained fallback attempt has nothing further to fall back to,
-    /// so it runs until `NWConnection` itself reports `.ready`/`.failed`).
+    /// so it runs until `NWConnection` itself reports `.ready`/`.failed`, or
+    /// the calling task is cancelled, which throws `CancellationError`).
     private func resolveOnce(
         endpoint: NWEndpoint,
         parameters: NWParameters,
@@ -290,61 +299,129 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         timeout: Duration?
     ) async throws -> NetworkAddress {
         let connection = NWConnection(to: endpoint, using: parameters)
+        defer { connection.stateUpdateHandler = nil }
 
         return try await withThrowingTaskGroup(of: NetworkAddress.self) { group in
             group.addTask {
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<NetworkAddress, Error>) in
-                    nonisolated(unsafe) var resumed = false
-                    connection.stateUpdateHandler = { [weak self] state in
-                        guard let self else { return }
-                        guard !resumed else { return }
-                        switch state {
-                        case .ready:
-                            // A `fallbackHostname` matters even here, not
-                            // just in the caller's own resolve-failure
-                            // fallback: a scoped host still carries a
-                            // correctly-resolved port from this same SRV
-                            // lookup, which mDNS *browsing* alone never
-                            // provides (`ServiceRecord.port` is `0` until
-                            // something resolves it) — losing that port by
-                            // treating a scoped host as a hard failure would
-                            // just move the same "not a valid URL" problem
-                            // from a bad host to a bad (`0`) port.
-                            if let remoteEndpoint = connection.currentPath?.remoteEndpoint,
-                               let address = NetworkAddress(
-                                   endpoint: remoteEndpoint,
-                                   fallbackHostname: "\(recordName).local"
-                               ) {
-                                resumed = true
-                                cont.resume(returning: address)
-                            } else {
-                                resumed = true
-                                cont.resume(throwing: ServiceDiscoveryError.resolveFailed(recordName))
-                            }
-                            connection.cancel()
-                        case .failed(let error):
-                            self.logger.error("Resolve failed for '\(recordName)': \(error)")
-                            resumed = true
-                            cont.resume(throwing: error)
-                            connection.cancel()
-                        case .cancelled:
-                            if !resumed {
-                                resumed = true
-                                cont.resume(throwing: CancellationError())
-                            }
-                        default:
-                            break
+                let outcome = ResolveOutcome()
+                // `onCancel` resumes the continuation itself rather than
+                // waiting for the connection's `.cancelled` state: a
+                // connection cancelled racing with `start` need
+                // not report any state. `ResolveOutcome` resumes at most once.
+                return try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { [weak self, weak connection] (cont: CheckedContinuation<NetworkAddress, Error>) in
+                        outcome.install(cont)
+                        guard let self, let connection else {
+                            outcome.finish(.failure(CancellationError()))
+                            return
                         }
+                        // `connection` is captured weakly: the handler would otherwise
+                        // form a cycle that only a delivered `.cancelled` breaks, and a
+                        // cancel racing `start` may never deliver one.
+                        connection.stateUpdateHandler = { [weak self, weak connection] state in
+                            guard let self, let connection else { return }
+                            switch state {
+                            case .ready:
+                                // A `fallbackHostname` matters even here, not
+                                // just in the caller's own resolve-failure
+                                // fallback, for a scoped IPv6 or IPv4
+                                // link-local host (a scoped routable IPv4
+                                // host is kept as its literal): it still carries a
+                                // correctly-resolved port from this same SRV
+                                // lookup, which mDNS *browsing* alone never
+                                // provides (`ServiceRecord.port` is `0` until
+                                // something resolves it) — losing that port by
+                                // treating a scoped host as a hard failure would
+                                // just move the same "not a valid URL" problem
+                                // from a bad host to a bad (`0`) port.
+                                if let remoteEndpoint = connection.currentPath?.remoteEndpoint,
+                                   let address = NetworkAddress(
+                                       endpoint: remoteEndpoint,
+                                       fallbackHostname: "\(recordName).local"
+                                   ) {
+                                    outcome.finish(.success(address))
+                                } else {
+                                    outcome.finish(.failure(ServiceDiscoveryError.resolveFailed(recordName)))
+                                }
+                                connection.cancel()
+                            case .failed(let error):
+                                self.logger.error("Resolve failed for '\(recordName)': \(error)")
+                                outcome.finish(.failure(error))
+                                connection.cancel()
+                            case .cancelled:
+                                outcome.finish(.failure(CancellationError()))
+                            default:
+                                break
+                            }
+                        }
+                        connection.start(queue: self.queue)
                     }
-                    connection.start(queue: self.queue)
+                } onCancel: {
+                    outcome.cancel()
+                    connection.cancel()
                 }
             }
             if let timeout {
                 group.addTask {
+                    // Cancelled sleep must still cancel the connection.
+                    defer { connection.cancel() }
                     try await Task.sleep(for: timeout)
-                    connection.cancel()
                     throw ServiceDiscoveryError.resolveFailed(recordName)
                 }
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
+    }
+
+    /// Resolves an instance to its address (via ``resolve(_:)``) and TXT.
+    ///
+    /// The TXT comes from `record` when it carries one — a browse result
+    /// does. Otherwise it is looked up with `DNSServiceResolve`, bounded by
+    /// ``txtResolveTimeout``. If that lookup gets no answer, the result
+    /// carries the address with empty TXT; only an address failure throws.
+    public func resolveService(_ record: ServiceRecord) async throws -> ResolvedService {
+        try await resolveService(record) { [self] record in
+            try await resolveTXT(record, timeout: Self.txtResolveTimeout)
+        }
+    }
+
+    /// ``resolveService(_:)`` with the TXT lookup injected, so the
+    /// "address resolved, TXT did not" outcome is testable deterministically.
+    func resolveService(
+        _ record: ServiceRecord,
+        lookUpTXT: @Sendable (ServiceRecord) async throws -> [String: String]
+    ) async throws -> ResolvedService {
+        let address = try await resolve(record)
+        if !record.txtRecords.isEmpty {
+            return ResolvedService(address: address, txtRecords: record.txtRecords)
+        }
+        do {
+            return ResolvedService(address: address, txtRecords: try await lookUpTXT(record))
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            logger.notice("TXT for '\(record.name)' could not be obtained (\(error)); returning address with empty TXT")
+            return ResolvedService(address: address, txtRecords: [:])
+        }
+    }
+
+    /// How long the `DNSServiceResolve` TXT lookup in ``resolveService(_:)``
+    /// gets. The same bound the address resolve puts on its first attempt
+    /// (``ipv4PreferenceTimeout``).
+    static let txtResolveTimeout: Duration = ipv4PreferenceTimeout
+
+    /// Look up an instance's TXT record with `DNSServiceResolve`, throwing
+    /// ``ServiceDiscoveryError/resolveFailed(_:)`` if no answer arrives
+    /// within `timeout`.
+    func resolveTXT(_ record: ServiceRecord, timeout: Duration) async throws -> [String: String] {
+        let name = record.name
+        let lookup = TXTLookup(name: name, type: record.serviceType.rawValue, queue: queue)
+        return try await withThrowingTaskGroup(of: [String: String].self) { group in
+            group.addTask { try await lookup.run() }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw ServiceDiscoveryError.resolveFailed(name)
             }
             defer { group.cancelAll() }
             return try await group.next()!
@@ -742,13 +819,12 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
             return nil
         }
 
+        // Decode the raw wire bytes rather than walking `NWTXTRecord`'s
+        // entries, so browse follows the same RFC 6763 rule (bare keys,
+        // first-occurrence-wins duplicates) as `resolveService`.
         var txtRecords: [String: String] = [:]
         if case .bonjour(let txtRecord) = result.metadata {
-            for (key, entry) in txtRecord {
-                if case .string(let value) = entry {
-                    txtRecords[key] = value
-                }
-            }
+            txtRecords = TXTRecord.decode(wireFormat: txtRecord.data)
         }
 
         return ServiceRecord(
@@ -768,4 +844,47 @@ public enum ServiceDiscoveryError: Error, Sendable {
     case resolveFailed(String)
     case registrationFailed(code: Int)
 }
+
+// MARK: - ResolveOutcome
+
+/// Resumes one `resolveOnce` continuation exactly once, from whichever of the
+/// connection's state handler or task cancellation gets there first.
+private final class ResolveOutcome: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<NetworkAddress, Error>?
+    private var cancelledEarly = false
+    private var finished = false
+
+    func install(_ continuation: CheckedContinuation<NetworkAddress, Error>) {
+        lock.lock()
+        if finished || cancelledEarly {
+            finished = true
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+        } else {
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    func finish(_ result: Result<NetworkAddress, Error>) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        let first = !finished
+        finished = true
+        lock.unlock()
+        if first, let pending { pending.resume(with: result) }
+    }
+
+    func cancel() {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        if pending == nil { cancelledEarly = true } else { finished = true }
+        lock.unlock()
+        pending?.resume(throwing: CancellationError())
+    }
+}
+
 #endif
