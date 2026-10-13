@@ -225,30 +225,36 @@ struct AppleServiceDiscoveryLiveTests {
     }
 
     /// Runs `operation` in its own task, cancels it once it has started, and
-    /// reports whether it returned before `guardDuration`. The wait on the
-    /// task is a cancellable stream read, so an operation that ignores
-    /// cancellation fails this check instead of hanging the test.
-    private static func returnsAfterCancel(
+    /// reports how it ended: `nil` if it did not return before
+    /// `guardDuration`, else whether it threw `CancellationError`. The wait is
+    /// a cancellable stream read, so an operation that ignores cancellation
+    /// fails the check instead of hanging the test.
+    private static func cancelledOutcome(
         guardDuration: Duration = hangGuard,
         _ operation: @escaping @Sendable () async throws -> Void
-    ) async -> Bool {
-        let (finished, signal) = AsyncStream<Void>.makeStream()
+    ) async -> Bool? {
+        let (finished, signal) = AsyncStream<Bool>.makeStream()
         let task = Task {
             defer { signal.finish() }
-            do { try await operation() } catch {}
+            do {
+                try await operation()
+                signal.yield(false)
+            } catch {
+                signal.yield(error is CancellationError)
+            }
         }
         // Long enough for the operation to be in flight; the assertion is only
         // that it returns, not when.
         try? await Task.sleep(for: .milliseconds(100))
         task.cancel()
-        return await withTaskGroup(of: Bool.self) { group in
+        return await withTaskGroup(of: Bool?.self) { group in
             group.addTask {
-                for await _ in finished {}
-                return !Task.isCancelled
+                for await threwCancellation in finished { return threwCancellation }
+                return nil
             }
             group.addTask {
                 try? await Task.sleep(for: guardDuration)
-                return false
+                return nil
             }
             defer { group.cancelAll() }
             return await group.next()!
@@ -264,10 +270,10 @@ struct AppleServiceDiscoveryLiveTests {
             host: "",
             port: 0
         )
-        let returned = await Self.returnsAfterCancel {
+        let outcome = await Self.cancelledOutcome {
             _ = try await discovery.resolve(absent)
         }
-        #expect(returned, "resolve did not return after cancellation")
+        #expect(outcome == true, "resolve must throw CancellationError promptly (nil = hung)")
     }
 
     @Test("cancelling resolveService of an absent instance returns instead of hanging")
@@ -279,10 +285,10 @@ struct AppleServiceDiscoveryLiveTests {
             host: "",
             port: 0
         )
-        let returned = await Self.returnsAfterCancel {
+        let outcome = await Self.cancelledOutcome {
             _ = try await discovery.resolveService(absent)
         }
-        #expect(returned, "resolveService did not return after cancellation")
+        #expect(outcome == true, "resolveService must throw CancellationError promptly (nil = hung)")
     }
 
     @Test("resolveTXT for an absent instance throws when its timeout elapses")

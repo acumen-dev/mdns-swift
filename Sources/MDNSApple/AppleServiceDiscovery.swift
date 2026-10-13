@@ -250,6 +250,8 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
     /// would simply hang for an IPv6-only device instead of falling back.
     static let ipv4PreferenceTimeout: Duration = .seconds(2)
 
+    /// Resolves an instance to an address. Honours task cancellation: a
+    /// cancelled resolve throws `CancellationError` promptly.
     public func resolve(_ record: ServiceRecord) async throws -> NetworkAddress {
         let endpoint = NWEndpoint.service(
             name: record.name,
@@ -287,7 +289,8 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
     /// One resolve attempt over one `NWConnection`, optionally bounded by
     /// `timeout` (used only for the IPv4-preference attempt — an
     /// unconstrained fallback attempt has nothing further to fall back to,
-    /// so it runs until `NWConnection` itself reports `.ready`/`.failed`).
+    /// so it runs until `NWConnection` itself reports `.ready`/`.failed`, or
+    /// the calling task is cancelled, which throws `CancellationError`).
     private func resolveOnce(
         endpoint: NWEndpoint,
         parameters: NWParameters,
@@ -295,19 +298,23 @@ public final class AppleServiceDiscovery: ServiceDiscovery, @unchecked Sendable 
         timeout: Duration?
     ) async throws -> NetworkAddress {
         let connection = NWConnection(to: endpoint, using: parameters)
+        defer { connection.stateUpdateHandler = nil }
 
         return try await withThrowingTaskGroup(of: NetworkAddress.self) { group in
             group.addTask {
                 let outcome = ResolveOutcome()
                 // `onCancel` resumes the continuation itself rather than
                 // waiting for the connection's `.cancelled` state: a
-                // connection cancelled before (or racing with) `start` need
+                // connection cancelled racing with `start` need
                 // not report any state. `ResolveOutcome` resumes at most once.
                 return try await withTaskCancellationHandler {
                     try await withCheckedThrowingContinuation { (cont: CheckedContinuation<NetworkAddress, Error>) in
                         outcome.install(cont)
-                        connection.stateUpdateHandler = { [weak self] state in
-                            guard let self else { return }
+                        // `connection` is captured weakly: the handler would otherwise
+                        // form a cycle that only a delivered `.cancelled` breaks, and a
+                        // cancel racing `start` may never deliver one.
+                        connection.stateUpdateHandler = { [weak self, weak connection] state in
+                            guard let self, let connection else { return }
                             switch state {
                             case .ready:
                                 // A `fallbackHostname` matters even here, not
