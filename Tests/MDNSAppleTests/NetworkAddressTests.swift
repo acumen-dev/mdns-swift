@@ -45,9 +45,10 @@ struct NetworkAddressTests {
 
     /// A fallback hostname derived from the instance name is wrong whenever
     /// the instance name is not the host name — every Matter device (random
-    /// 64-bit instance name, MAC-derived host name). For IPv4 it is never
-    /// needed: the literal is usable.
-    @Test("a scoped IPv4 endpoint keeps its literal and port even when a fallback hostname is given")
+    /// 64-bit instance name, MAC-derived host name). A routable IPv4 address
+    /// never needs it: the literal is usable. (A scoped link-local one does —
+    /// see below.)
+    @Test("a scoped routable IPv4 endpoint keeps its literal and port even when a fallback hostname is given")
     func scopedIPv4IgnoresFallbackHostname() throws {
         let addr = try #require(IPv4Address("192.0.2.104%lo0"))
         #expect(addr.interface != nil)

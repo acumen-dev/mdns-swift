@@ -100,6 +100,28 @@ public struct ServiceRecord: Sendable {
 // MARK: - NetworkAddress
 
 /// A resolved network address (host + port).
+///
+/// The forms of `host` a resolve returns:
+///
+/// - **IPv4**: a dotted-quad literal (`"192.0.2.10"`).
+/// - **IPv6**: a literal in brackets (`"[fd00::1]"`), the RFC 3986 URL-host
+///   form, so `host` drops straight into a URL authority. Socket APIs
+///   (`inet_pton`, `getaddrinfo`, `SocketAddress(ipAddress:port:)`) reject the
+///   brackets: strip them before parsing. The literal's text is not
+///   canonical — `MDNSLinux` writes every group in full
+///   (`"[fd00:0:0:0:0:0:0:1]"`) — so compare parsed addresses, not strings.
+/// - **A host name** (`"<instance>.local"`): on Apple platforms, when the
+///   resolved address is interface-scoped — an IPv6 address with a scope
+///   (typically link-local `fe80::/10`) or a scoped IPv4 link-local address
+///   (`169.254.0.0/16`) — whose scope cannot be carried in a portable string.
+///   The name is derived from the *instance* name, which need not be the
+///   device's host name, so it may not resolve. The port is still the
+///   resolved one.
+///
+/// `MDNSLinux` carries no interface scope: a link-local address is returned
+/// as an unscoped literal, usable only where the routing table picks the right
+/// interface. There, a service this process advertises itself resolves to
+/// `ProcessInfo.processInfo.hostName`.
 public struct NetworkAddress: Sendable, Hashable {
     public let host: String
     public let port: UInt16
@@ -204,6 +226,9 @@ public protocol ServiceDiscovery: Sendable {
 
     /// Resolve a discovered service record to a network address.
     ///
+    /// The host is an IPv4 literal, a bracketed IPv6 literal or a host name;
+    /// see ``NetworkAddress`` for when each occurs.
+    ///
     /// Must honour task cancellation: a cancelled resolve stops and throws
     /// promptly (`CancellationError`). Resolution may otherwise wait
     /// indefinitely for an instance that never answers, so callers bound it
@@ -213,7 +238,8 @@ public protocol ServiceDiscovery: Sendable {
     /// Resolves an instance to its address and TXT record.
     ///
     /// `txtRecords` is empty when the instance's TXT could not be obtained;
-    /// address resolution failure throws. Must honour task cancellation as
+    /// address resolution failure throws. The address's host takes the forms
+    /// described on ``NetworkAddress``. Must honour task cancellation as
     /// ``resolve(_:)`` does: callers bound it by cancelling.
     func resolveService(_ record: ServiceRecord) async throws -> ResolvedService
 
