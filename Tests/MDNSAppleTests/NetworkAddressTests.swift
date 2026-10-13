@@ -30,29 +30,29 @@ struct NetworkAddressTests {
         try #require(urlBuilds(fromHost: address.host))
     }
 
-    @Test("an interface-scoped IPv4 endpoint (e.g. \"192.168.1.23%en1\") is rejected when no fallback is given")
-    func scopedIPv4Rejected() throws {
-        let addr = try #require(IPv4Address("192.168.1.23%en1"))
+    @Test("an interface-scoped IPv4 endpoint (e.g. \"192.0.2.23%lo0\") resolves to its bare literal")
+    func scopedIPv4YieldsBareLiteral() throws {
+        let addr = try #require(IPv4Address("192.0.2.23%lo0"))
         #expect(addr.interface != nil) // sanity: this really is what we think it is
-        let endpoint = NWEndpoint.hostPort(host: .ipv4(addr), port: 80)
-        #expect(NetworkAddress(endpoint: endpoint) == nil)
+        let endpoint = NWEndpoint.hostPort(host: .ipv4(addr), port: 5540)
+        let address = try #require(NetworkAddress(endpoint: endpoint))
+        #expect(address.host == "192.0.2.23")
+        #expect(address.port == 5540)
+        try #require(urlBuilds(fromHost: address.host, port: Int(address.port)))
     }
 
-    @Test("a scoped IPv4 endpoint substitutes the fallback hostname but keeps the resolved port")
-    func scopedIPv4UsesFallbackHostnamePreservingPort() throws {
-        let addr = try #require(IPv4Address("192.168.173.104%en1"))
+    /// A fallback hostname derived from the instance name is wrong whenever
+    /// the instance name is not the host name — every Matter device (random
+    /// 64-bit instance name, MAC-derived host name). For IPv4 it is never
+    /// needed: the literal is usable.
+    @Test("a scoped IPv4 endpoint keeps its literal and port even when a fallback hostname is given")
+    func scopedIPv4IgnoresFallbackHostname() throws {
+        let addr = try #require(IPv4Address("192.0.2.104%lo0"))
+        #expect(addr.interface != nil)
         let endpoint = NWEndpoint.hostPort(host: .ipv4(addr), port: 80)
-        let address = try #require(NetworkAddress(endpoint: endpoint, fallbackHostname: "shelly1.local"))
-        #expect(address.host == "shelly1.local")
-        // The real, actual bug this guards against: a caller that discards
-        // a scoped address's port along with its rejected host — falling
-        // back to a bare "<name>.local" guess with no port info, since mDNS
-        // browsing alone never carries one — ends up dispatching to port 0,
-        // which fails at request-submission time (NSURLErrorBadURL) even
-        // though `URLComponents` itself doesn't reject it. Confirmed
-        // against real hardware — see CLAUDE.md item 5's fix history.
+        let address = try #require(NetworkAddress(endpoint: endpoint, fallbackHostname: "0123456789ABCDEF.local"))
+        #expect(address.host == "192.0.2.104")
         #expect(address.port == 80)
-        try #require(urlBuilds(fromHost: address.host, port: Int(address.port)))
     }
 
     @Test("a plain (unscoped) global/ULA IPv6 endpoint resolves to a bracketed, URL-safe host")
