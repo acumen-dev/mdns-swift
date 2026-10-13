@@ -60,12 +60,18 @@ public struct DNSRecord: Sendable {
     /// TTL in seconds. Use 0 for "goodbye" records (mDNS §11.3).
     public var ttl: UInt32
     public var rdata: DNSRData
+    /// The cache-flush bit (top bit of the record's class, RFC 6762 §10.2):
+    /// this record replaces, rather than joins, other records of the same name
+    /// and type. Set by `DNSMessage.decode` from the wire. The encoder sets
+    /// the bit on every record of a response, whatever this field holds.
+    public var cacheFlush: Bool
 
-    public init(name: String, type: DNSRecordType, ttl: UInt32, rdata: DNSRData) {
+    public init(name: String, type: DNSRecordType, ttl: UInt32, rdata: DNSRData, cacheFlush: Bool = false) {
         self.name = name
         self.type = type
         self.ttl = ttl
         self.rdata = rdata
+        self.cacheFlush = cacheFlush
     }
 }
 
@@ -328,7 +334,7 @@ struct DNSParser {
     mutating func readRecord() -> DNSRecord? {
         guard let name   = readName(),
               let rtype  = readUInt16(),
-              let _      = readUInt16(), // class (ignore cache-flush bit)
+              let rclass = readUInt16(),
               let ttl    = readUInt32(),
               let rdlen  = readUInt16()
         else { return nil }
@@ -373,7 +379,7 @@ struct DNSParser {
         // Advance to end of RDATA in case we didn't read it all (e.g. unknown)
         offset = rdataStart + Int(rdlen)
 
-        return DNSRecord(name: name, type: recordType, ttl: ttl, rdata: rdata)
+        return DNSRecord(name: name, type: recordType, ttl: ttl, rdata: rdata, cacheFlush: (rclass & 0x8000) != 0)
     }
 }
 

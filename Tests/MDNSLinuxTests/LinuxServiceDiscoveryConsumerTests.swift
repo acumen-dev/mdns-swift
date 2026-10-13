@@ -30,10 +30,13 @@ struct LinuxServiceDiscoveryConsumerTests {
     /// A discovery whose outgoing messages land in the returned stream.
     static func makeDiscovery(
         resolveTimeout: Duration = .seconds(5),
-        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        clock: ManualClock = ManualClock()
     ) -> (LinuxServiceDiscovery, AsyncStream<DNSMessage>) {
         let (sent, sink) = AsyncStream.makeStream(of: DNSMessage.self)
-        let discovery = LinuxServiceDiscovery(resolveTimeout: resolveTimeout, sleep: sleep) { sink.yield($0) }
+        let discovery = LinuxServiceDiscovery(
+            resolveTimeout: resolveTimeout, sleep: sleep, now: { clock.now }
+        ) { sink.yield($0) }
         return (discovery, sent)
     }
 
@@ -150,6 +153,8 @@ struct LinuxServiceDiscoveryConsumerTests {
         async let second = discovery.resolveService(Self.record)
         _ = await queries.next()
         #expect(await timerEvents.next() == .parked(1))
+        // Firing the first resolve's timer now must not touch the second.
+        await timers.fire(0)
         try await Self.feed(discovery, [Self.srv, Self.txtRecord, Self.a])
         #expect(try await second.address.port == 5540)
         #expect(await timerEvents.next() == .cancelled(1))
@@ -181,6 +186,73 @@ struct LinuxServiceDiscoveryConsumerTests {
 
         let resolved = try await resolving
         #expect(resolved == ResolvedService(address: NetworkAddress(host: "192.0.2.10", port: 5540), txtRecords: [:]))
+    }
+
+    @Test("After the device's address changes, resolve returns the new address, not the cached old one")
+    func resolveFollowsAddressChange() async throws {
+        let clock = ManualClock()
+        let (discovery, sent) = Self.makeDiscovery(clock: clock)
+        var queries = sent.makeAsyncIterator()
+
+        async let resolving = discovery.resolveService(Self.record)
+        _ = await queries.next()
+        try await Self.feed(discovery, [Self.srv, Self.txtRecord, Self.a])
+        #expect(try await resolving.address.host == "192.0.2.10")
+
+        clock.advance(by: .seconds(2))
+        let moved = DNSRecord(name: "host-1.local", type: .a, ttl: 120, rdata: .a(Data([192, 0, 2, 20])))
+        try await Self.feed(discovery, [moved]) // a response, so cache-flush is set
+        #expect(try await discovery.resolve(Self.record) == NetworkAddress(host: "192.0.2.20", port: 5540))
+    }
+
+    // MARK: - Follow-up backoff
+
+    @Test("An unanswered follow-up question is not repeated until its interval passes, and the interval doubles")
+    func followUpQueriesBackOff() async throws {
+        let clock = ManualClock()
+        let (discovery, sent) = Self.makeDiscovery(clock: clock)
+        var queries = sent.makeAsyncIterator()
+        let browsing = discovery.browse(serviceType: ServiceType(Self.type))
+        defer { withExtendedLifetime(browsing) {} } // dropping the stream ends the browse
+        _ = await queries.next() // PTR query: the browse is registered
+
+        // handleIncoming sends a packet's follow-ups before it returns, so the
+        // next message in `queries` is the first one sent after the last feed.
+        try await Self.feed(discovery, [Self.ptr])
+        #expect(Self.questions(await queries.next()) == ["\(Self.fullName) srv", "\(Self.fullName) txt"])
+        try await Self.feed(discovery, [Self.ptr])
+        try await Self.feed(discovery, [Self.ptr])
+        // The SRV answer resets its question and triggers a new one, which is
+        // the next message: the two repeated PTR packets asked nothing.
+        try await Self.feed(discovery, [Self.srv])
+        #expect(Self.questions(await queries.next()) == ["host-1.local a", "host-1.local aaaa"])
+
+        // TXT is still unanswered. After 1 s it may be asked once more…
+        clock.advance(by: .seconds(1))
+        try await Self.feed(discovery, [Self.ptr])
+        #expect(Self.questions(await queries.next()) == ["\(Self.fullName) txt"])
+
+        // …and then not for another 2 s.
+        clock.advance(by: .milliseconds(1500))
+        try await Self.feed(discovery, [Self.ptr])
+        let moved = DNSRecord(name: Self.fullName, type: .srv, ttl: 120,
+                              rdata: .srv(priority: 0, weight: 0, port: 5540, target: "host-2.local"))
+        try await Self.feed(discovery, [moved])
+        #expect(Self.questions(await queries.next()) == ["host-2.local a", "host-2.local aaaa"])
+
+        clock.advance(by: .milliseconds(500))
+        try await Self.feed(discovery, [Self.ptr])
+        #expect(Self.questions(await queries.next()) == ["\(Self.fullName) txt"])
+    }
+
+    @Test("A browse stream removed before its browser is added leaves no browser behind")
+    func browserRemovedBeforeAdded() async {
+        let (discovery, _) = Self.makeDiscovery()
+        let id = UUID()
+        let (_, continuation) = AsyncStream.makeStream(of: ServiceRecord.self)
+        await discovery.removeBrowser(id: id)
+        #expect(await discovery.addBrowser(continuation, id: id, serviceType: Self.type) == false)
+        #expect(await discovery.browserCount == 0)
     }
 
     @Test("Cancelling a pending resolve ends it with CancellationError and cancels its timeout")
@@ -262,5 +334,21 @@ actor ManualTimers {
         }
         sink.yield(.cancelled(id))
         continuation.resume(throwing: CancellationError())
+    }
+}
+
+// MARK: - ManualClock
+
+/// A clock that moves only when the test advances it.
+final class ManualClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = ContinuousClock.now
+
+    var now: ContinuousClock.Instant {
+        lock.withLock { current }
+    }
+
+    func advance(by duration: Duration) {
+        lock.withLock { current += duration }
     }
 }

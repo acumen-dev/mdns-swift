@@ -155,4 +155,13 @@ struct DNSMessageTests {
         }
         #expect(strings == ["k=\u{FFFD}"])
     }
+
+    @Test("Decode carries the cache-flush bit: set on a response's records, clear on a query's")
+    func cacheFlushDecoded() throws {
+        let record = DNSRecord(name: "host-1.local", type: .a, ttl: 120, rdata: .a(Data([192, 0, 2, 1])))
+        let response = try #require(DNSMessage.decode(from: DNSMessage(isResponse: true, answers: [record]).encode()))
+        #expect(response.answers.first?.cacheFlush == true)
+        let query = try #require(DNSMessage.decode(from: DNSMessage(isResponse: false, answers: [record]).encode()))
+        #expect(query.answers.first?.cacheFlush == false)
+    }
 }

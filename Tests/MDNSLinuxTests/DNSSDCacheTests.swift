@@ -147,4 +147,47 @@ struct DNSSDCacheTests {
         ]), now: .now)
         #expect(cache.addresses(host: "host-1.local") == ["[fe80:0:0:0:1234:5678:9abc:def0]"])
     }
+
+    // MARK: Cache-flush (RFC 6762 §10.2)
+
+    static func address(_ last: UInt8, cacheFlush: Bool) -> DNSRecord {
+        DNSRecord(name: "host-1.local", type: .a, ttl: 120, rdata: .a(Data([192, 0, 2, last])), cacheFlush: cacheFlush)
+    }
+
+    @Test("A cache-flush A record heard later replaces the host's older A record")
+    func cacheFlushReplacesOlderAddress() {
+        var cache = DNSSDCache()
+        let start = ContinuousClock.now
+        cache.ingest([Self.address(1, cacheFlush: true)], now: start)
+        cache.ingest([Self.address(2, cacheFlush: true)], now: start + .seconds(2))
+        #expect(cache.addresses(host: "host-1.local") == ["192.0.2.2"])
+    }
+
+    @Test("Without cache-flush both addresses are kept, the newest first")
+    func sharedAddressesNewestFirst() {
+        var cache = DNSSDCache()
+        let start = ContinuousClock.now
+        cache.ingest([Self.address(1, cacheFlush: false)], now: start)
+        cache.ingest([Self.address(2, cacheFlush: false)], now: start + .seconds(2))
+        #expect(cache.addresses(host: "host-1.local") == ["192.0.2.2", "192.0.2.1"])
+    }
+
+    @Test("Cache-flush records heard within 1 s of each other are kept together")
+    func cacheFlushKeepsSameBurst() {
+        var cache = DNSSDCache()
+        let start = ContinuousClock.now
+        cache.ingest([Self.address(1, cacheFlush: true)], now: start)
+        cache.ingest([Self.address(2, cacheFlush: true)], now: start + .milliseconds(500))
+        #expect(cache.addresses(host: "host-1.local") == ["192.0.2.2", "192.0.2.1"])
+    }
+
+    @Test("Cache-flush on an A record leaves the host's AAAA records alone")
+    func cacheFlushIsPerType() {
+        let v6 = Data([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0])
+        var cache = DNSSDCache()
+        let start = ContinuousClock.now
+        cache.ingest([DNSRecord(name: "host-1.local", type: .aaaa, ttl: 120, rdata: .aaaa(v6), cacheFlush: true)], now: start)
+        cache.ingest([Self.address(2, cacheFlush: true)], now: start + .seconds(2))
+        #expect(cache.addresses(host: "host-1.local") == ["192.0.2.2", "[fe80:0:0:0:1234:5678:9abc:def0]"])
+    }
 }

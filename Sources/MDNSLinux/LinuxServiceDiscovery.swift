@@ -41,9 +41,16 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
     private var advertised: [String: ServiceRecord] = [:]
     /// Browse subscriptions, keyed by stream so each can be removed on termination.
     private var browsers: [UUID: Browser] = [:]
+    /// Streams that terminated before their browser was added. `addBrowser`
+    /// and `removeBrowser` arrive on separate unstructured tasks, so removal
+    /// can win; the tombstone stops the late add from leaking a browser.
+    private var removedBrowsers: Set<UUID> = []
     /// Resolve waiters, keyed by lowercase full instance name, then by waiter.
     private var pendingResolves: [String: [UUID: ResolveWaiter]] = [:]
     private var cache = DNSSDCache()
+    /// Follow-up questions last asked, by lowercase name and type, with the
+    /// interval before the same question may be asked again (RFC 6762 §5.2).
+    private var followUpBackoff: [String: (asked: ContinuousClock.Instant, interval: Duration)] = [:]
     private var channel: Channel?
     private let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     private let logger: Logger
@@ -51,6 +58,7 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
     /// How long each resolve waits for an answer.
     private let resolveTimeout: Duration
     private let sleep: @Sendable (Duration) async throws -> Void
+    private let now: @Sendable () -> ContinuousClock.Instant
     /// Test seam: when set, outgoing messages go here and no socket is bound.
     private let injectedSender: (@Sendable (DNSMessage) async -> Void)?
 
@@ -71,7 +79,13 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
     // MARK: - Init
 
     public init(logger: Logger = Logger(label: "mdns.linux.discovery")) {
-        self.init(logger: logger, resolveTimeout: .seconds(5), sleep: { try await Task.sleep(for: $0) }, injectedSender: nil)
+        self.init(
+            logger: logger,
+            resolveTimeout: .seconds(5),
+            sleep: { try await Task.sleep(for: $0) },
+            now: { .now },
+            injectedSender: nil
+        )
     }
 
     /// Never binds a socket: every outgoing message is handed to `sender`, and
@@ -80,20 +94,23 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
         logger: Logger = Logger(label: "mdns.linux.discovery"),
         resolveTimeout: Duration = .seconds(5),
         sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        now: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
         sender: @escaping @Sendable (DNSMessage) async -> Void
     ) {
-        self.init(logger: logger, resolveTimeout: resolveTimeout, sleep: sleep, injectedSender: sender)
+        self.init(logger: logger, resolveTimeout: resolveTimeout, sleep: sleep, now: now, injectedSender: sender)
     }
 
     private init(
         logger: Logger,
         resolveTimeout: Duration,
         sleep: @escaping @Sendable (Duration) async throws -> Void,
+        now: @escaping @Sendable () -> ContinuousClock.Instant,
         injectedSender: (@Sendable (DNSMessage) async -> Void)?
     ) {
         self.logger = logger
         self.resolveTimeout = resolveTimeout
         self.sleep = sleep
+        self.now = now
         self.injectedSender = injectedSender
     }
 
@@ -133,7 +150,7 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
         let streamID = UUID()
         return AsyncStream { [weak self] continuation in
             Task { [weak self] in
-                await self?.addBrowser(continuation, id: streamID, serviceType: type)
+                guard await self?.addBrowser(continuation, id: streamID, serviceType: type) == true else { return }
                 try? await self?.ensureMDNSChannel()
                 try? await self?.send(DNSMessage(
                     isResponse: false,
@@ -165,7 +182,7 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
         }
         let instance = record.name
         let type = record.serviceType.rawValue
-        cache.ingest([], now: .now)
+        cache.ingest([], now: now())
         if let resolved = cachedResolution(instance: instance, serviceType: type) {
             return resolved
         }
@@ -200,20 +217,27 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
 
     // MARK: - Internal: Browse subscriptions
 
-    private func addBrowser(
+    /// Returns `false`, adding nothing, when the stream already terminated.
+    func addBrowser(
         _ continuation: AsyncStream<ServiceRecord>.Continuation,
         id: UUID,
         serviceType: String
-    ) {
+    ) -> Bool {
+        guard removedBrowsers.remove(id) == nil else { return false }
         browsers[id] = Browser(serviceType: serviceType, continuation: continuation)
         // Instances already complete in the cache are yielded straight away.
-        cache.ingest([], now: .now)
+        cache.ingest([], now: now())
         updateBrowser(id: id)
+        return true
     }
 
-    private func removeBrowser(id: UUID) {
-        browsers[id] = nil
+    func removeBrowser(id: UUID) {
+        if browsers.removeValue(forKey: id) == nil {
+            removedBrowsers.insert(id)
+        }
     }
+
+    var browserCount: Int { browsers.count }
 
     /// Yields each instance whose TXT is known and differs from what this
     /// browser last yielded for it; forgets instances that have left the
@@ -274,7 +298,7 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
 
     private func expireResolve(key: String, id: UUID) {
         guard let waiter = removeWaiter(key: key, id: id) else { return }
-        cache.ingest([], now: .now)
+        cache.ingest([], now: now())
         if let address = cachedAddress(instance: waiter.instance, serviceType: waiter.serviceType) {
             logger.notice("No TXT for '\(waiter.instance)' within the resolve timeout; returning its address with empty TXT")
             waiter.continuation.resume(returning: ResolvedService(address: address, txtRecords: [:]))
@@ -396,31 +420,46 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
 
     // MARK: - Internal: Incoming packet handler
 
-    func handleIncoming(data: Data, from sender: SocketAddress) {
+    func handleIncoming(data: Data, from sender: SocketAddress) async {
         guard let msg = DNSMessage.decode(from: data) else { return }
         if msg.isResponse {
-            handleResponse(msg)
+            await handleResponse(msg)
         } else {
             handleQuery(msg)
         }
     }
 
-    private func handleResponse(_ msg: DNSMessage) {
+    /// Updates the cache, browsers and waiters, then sends any follow-up
+    /// queries before returning, so a caller that awaits this sees them sent.
+    private func handleResponse(_ msg: DNSMessage) async {
         let records = msg.answers + msg.additionals
-        cache.ingest(records, now: .now)
-        askFollowUps(after: records)
+        let heard = now()
+        cache.ingest(records, now: heard)
+        for record in records where record.ttl > 0 {
+            followUpBackoff["\(record.name.dnsLowercased) \(record.type.rawValue)"] = nil
+        }
+        let questions = followUps(after: records, now: heard)
         for id in browsers.keys { updateBrowser(id: id) }
         fulfilResolves()
+        guard !questions.isEmpty else { return }
+        try? await send(DNSMessage(isResponse: false, questions: questions))
     }
 
     /// Queries what a browse or a pending resolve still lacks, driven by the
     /// records just heard: a browsed type's PTR → SRV and TXT for the
     /// instance; an interesting instance's SRV → A/AAAA for its target.
-    private func askFollowUps(after records: [DNSRecord]) {
+    ///
+    /// A question still unanswered is not asked again until its interval has
+    /// passed: 1 s after the first ask, doubling with each repeat up to an
+    /// hour (RFC 6762 §5.2). Hearing an answer resets it.
+    private func followUps(after records: [DNSRecord], now: ContinuousClock.Instant) -> [DNSQuestion] {
         var questions: [DNSQuestion] = []
-        var asked: Set<String> = []
         func ask(_ name: String, _ type: DNSRecordType) {
-            guard asked.insert("\(name.dnsLowercased) \(type.rawValue)").inserted else { return }
+            let key = "\(name.dnsLowercased) \(type.rawValue)"
+            let previous = followUpBackoff[key]
+            if let previous, now - previous.asked < previous.interval { return }
+            let interval = previous.map { min($0.interval * 2, .seconds(3600)) } ?? .seconds(1)
+            followUpBackoff[key] = (now, interval)
             questions.append(DNSQuestion(name: name, type: type))
         }
         let browsedTypes = Set(browsers.values.map(\.serviceType))
@@ -446,8 +485,7 @@ public actor LinuxServiceDiscovery: ServiceDiscovery {
                 continue
             }
         }
-        guard !questions.isEmpty else { return }
-        Task { try? await self.send(DNSMessage(isResponse: false, questions: questions)) }
+        return questions
     }
 
     /// Extracts `(recordName, host)` pairs from A/AAAA records in resolve

@@ -13,6 +13,10 @@ import MDNSCore
 /// `now` they were ingested with; expired records are dropped at the next
 /// `ingest`, so a reader that wants an up-to-date view ingests `[]` first.
 /// A TTL-0 record is a goodbye (RFC 6762 §10.1) and removes what it names.
+/// SRV and TXT hold one value per instance, so a newer one replaces the
+/// older; A/AAAA honour the cache-flush bit (RFC 6762 §10.2). Shared PTRs do
+/// not: a cache-flush bit on a service-type PTR is a responder error and
+/// would otherwise evict every other responder's instances.
 struct DNSSDCache: Sendable {
 
     private struct Entry<Value: Sendable>: Sendable {
@@ -31,8 +35,15 @@ struct DNSSDCache: Sendable {
     private var services: [String: Entry<Service>] = [:]
     /// Instance name → TXT character-strings, in the order received.
     private var texts: [String: Entry<[String]>] = [:]
-    /// Host name → A and AAAA records, in the order first heard.
-    private var addressRecords: [String: [Entry<DNSRecord>]] = [:]
+    private struct AddressEntry: Sendable {
+        var record: DNSRecord
+        var expiry: ContinuousClock.Instant
+        /// When this record was last heard; drives cache-flush eviction.
+        var heard: ContinuousClock.Instant
+    }
+
+    /// Host name → A and AAAA records, most recently heard first.
+    private var addressRecords: [String: [AddressEntry]] = [:]
 
     // MARK: Ingest
 
@@ -56,12 +67,17 @@ struct DNSSDCache: Sendable {
                 texts[owner] = isGoodbye ? nil : Entry(value: strings, expiry: expiry)
             case .a(let bytes), .aaaa(let bytes):
                 var entries = addressRecords[owner] ?? []
-                let existing = entries.firstIndex { Self.sameAddress($0.value, record.type, bytes) }
-                switch (existing, isGoodbye) {
-                case (let index?, true): entries.remove(at: index)
-                case (let index?, false): entries[index] = Entry(value: record, expiry: expiry)
-                case (nil, false): entries.append(Entry(value: record, expiry: expiry))
-                case (nil, true): break
+                entries.removeAll { Self.sameAddress($0.record, record.type, bytes) }
+                if !isGoodbye {
+                    if record.cacheFlush {
+                        // RFC 6762 §10.2: a cache-flush record replaces the
+                        // records of this name and type heard more than 1 s
+                        // earlier — so an address change takes effect now,
+                        // not when the old record's TTL lapses. Records from
+                        // the same burst (within 1 s) are kept together.
+                        entries.removeAll { $0.record.type == record.type && now - $0.heard > .seconds(1) }
+                    }
+                    entries.insert(AddressEntry(record: record, expiry: expiry, heard: now), at: 0)
                 }
                 addressRecords[owner] = entries.isEmpty ? nil : entries
             case .unknown:
@@ -92,8 +108,9 @@ struct DNSSDCache: Sendable {
     }
 
     /// Addresses for a host, A before AAAA, formatted as resolvableHosts does today.
+    /// Within each family, the most recently heard address comes first.
     func addresses(host: String) -> [String] {
-        let records = (addressRecords[host.dnsLowercased] ?? []).map(\.value)
+        let records = (addressRecords[host.dnsLowercased] ?? []).map(\.record)
         return LinuxServiceDiscovery.resolvableHosts(from: records).map(\.host)
     }
 
